@@ -41,8 +41,10 @@ enum KioskState {
   PAYMENT_LOADING, 
   WAITING_PAYMENT,
   READY_TO_SCAN,
+  PREPARE_VEHICLE,
   SCANNING,
   DISPLAY_RESULTS,
+  SCAN_COMPLETE,
   ERROR_STATE,
   VEHICLE_SETUP,   
   VEHICLE_DETECTING,
@@ -90,6 +92,7 @@ struct FaultCode {
 std::vector<FaultCode> detectedCodes;
 std::vector<uint16_t> activeECUs;
 bool vehicleDetected = false; // Track if vehicle was detected during scan
+int scanRetryCount = 0; // Track scan retry attempts
 twai_message_t message;
 ELM327 myELM327;
 
@@ -118,8 +121,10 @@ void displayQRCode();
 void displayPaymentLoading();
 void displayWaitingPayment();
 void displayReadyToScan(bool fullRedraw = false);
+void displayPrepareVehicle();
 void displayScanning(bool fullRedraw = false);
 void displayScanResults();
+void displayScanComplete();
 void displayError(String message);
 void drawQRCode(String data, int x, int y, int scale);
 
@@ -255,13 +260,13 @@ void updateKioskState() {
       
     case DISPLAY_QR:
       displayQRCode();
-      // Auto-transition to payment polling after QR is displayed
-      // Give customer time to scan QR code and navigate to payment
-      if (millis() - stateStartTime > 5000) { // 5 seconds to scan QR
+      // Give customer plenty of time to scan QR code and complete payment
+      // Transition to payment polling after a longer delay to ensure QR is visible
+      if (millis() - stateStartTime > 30000) { // 30 seconds to scan QR and start payment
         currentState = WAITING_PAYMENT;
         lastPaymentCheck = millis(); // Initialize payment polling
         stateStartTime = millis();
-        Serial.println("⏰ Transitioning to payment waiting mode...");
+        Serial.println("⏰ Transitioning to payment waiting mode (customer has had time to scan)...");
       }
       break;
       
@@ -278,8 +283,8 @@ void updateKioskState() {
       if (millis() - lastPaymentCheck > PAYMENT_POLL_INTERVAL) {
         lastPaymentCheck = millis();
         if (checkPaymentStatus()) {
-          Serial.println("✅ Payment confirmed! Auto-starting scan...");
-          currentState = SCANNING;  // Auto-start scan immediately
+          Serial.println("✅ Payment confirmed! Preparing for vehicle scan...");
+          currentState = PREPARE_VEHICLE;  // Give user time to prepare vehicle
           sessionStartTime = millis();
           stateStartTime = millis();
         }
@@ -288,6 +293,18 @@ void updateKioskState() {
       
     case READY_TO_SCAN:
       displayReadyToScan();
+      break;
+      
+    case PREPARE_VEHICLE:
+      {
+        displayPrepareVehicle();
+        // Give user time to turn on ignition and prepare
+        if (millis() - stateStartTime > 15000) { // 15 seconds to prepare
+          currentState = SCANNING;
+          stateStartTime = millis();
+          Serial.println("🔍 Starting diagnostic scan after preparation time...");
+        }
+      }
       break;
       
     case SCANNING:
@@ -300,10 +317,31 @@ void updateKioskState() {
     case DISPLAY_RESULTS:
       {
         displayScanResults();
-        // Auto-return to ready after showing results
-        // Use longer timeout if no vehicle was detected
-        unsigned long displayTimeout = (!vehicleDetected && detectedCodes.size() == 0) ? 60000 : 10000;
-        if (millis() - stateStartTime > displayTimeout) {
+        
+        // Check if we should retry (no vehicle detected and retries available)
+        if (!vehicleDetected && scanRetryCount < 2) { // Allow up to 2 retries
+          if (millis() - stateStartTime > 5000) { // Show "no vehicle" for 5 seconds
+            scanRetryCount++;
+            Serial.printf("🔄 Retry attempt %d/2 - returning to preparation...\n", scanRetryCount);
+            currentState = PREPARE_VEHICLE;
+            stateStartTime = millis();
+          }
+        } else {
+          // Vehicle detected OR max retries reached - proceed to completion
+          if (millis() - stateStartTime > 3000) { // Show results for 3 seconds
+            currentState = SCAN_COMPLETE;
+            stateStartTime = millis();
+            Serial.println("➡️ Transitioning to scan completion screen");
+          }
+        }
+      }
+      break;
+      
+    case SCAN_COMPLETE:
+      {
+        displayScanComplete();
+        // Auto-return to ready after showing completion message
+        if (millis() - stateStartTime > 15000) { // 15 seconds to read and disconnect
           Serial.println("🔄 Auto-reset timeout reached, returning to ready state");
           resetToReady();
         }
@@ -595,6 +633,70 @@ void displayReadyToScan(bool fullRedraw) {
   Serial.println("📺 Ready to scan displayed");
 }
 
+void displayPrepareVehicle() {
+  static bool displayed = false;
+  static unsigned long lastUpdate = 0;
+  
+  // Redraw if forced or not displayed
+  if (!displayed || forceRedraw) {
+    displayed = true;
+    if (forceRedraw) forceRedraw = false; // Clear the force redraw flag
+    
+    tft.fillScreen(TFT_ORANGE);
+    
+    // Header
+    tft.fillRect(0, 0, SCREEN_WIDTH, 40, TFT_DARKCYAN);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(40, 15);
+    tft.println("PREPARE VEHICLE");
+    
+    // Main instructions
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(20, 70);
+    tft.println("Please:");
+    
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_BLACK);
+    int y = 110;
+    tft.setCursor(10, y);
+    tft.println("1. Turn on vehicle ignition");
+    y += 20;
+    tft.setCursor(10, y);
+    tft.println("2. Engine can be ON or OFF");
+    y += 20;
+    tft.setCursor(10, y);
+    tft.println("3. Ensure OBD2 cable is");
+    y += 15;
+    tft.setCursor(15, y);
+    tft.println("firmly connected");
+    y += 25;
+    
+    tft.setTextColor(TFT_DARKGREEN);
+    tft.setCursor(10, y);
+    tft.println("Scan will start automatically");
+    
+    Serial.println("📺 Prepare vehicle screen displayed");
+  }
+  
+  // Update countdown every second
+  if (millis() - lastUpdate > 1000) {
+    lastUpdate = millis();
+    
+    // Calculate remaining time
+    unsigned long elapsed = millis() - stateStartTime;
+    unsigned long remaining = (15000 > elapsed) ? (15000 - elapsed) / 1000 : 0;
+    
+    // Update countdown at bottom
+    tft.fillRect(10, SCREEN_HEIGHT - 25, SCREEN_WIDTH - 20, 20, TFT_ORANGE);
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(10, SCREEN_HEIGHT - 20);
+    tft.printf("Starting scan in %d seconds...", (int)remaining);
+  }
+}
+
 void displayScanning(bool fullRedraw) {
   static bool displayed = false;
   if (displayed && !fullRedraw) return;
@@ -711,6 +813,108 @@ void displayScanResults() {
     tft.setTextColor(TFT_DARKGREY);
     tft.setCursor(10, SCREEN_HEIGHT - 25);
     tft.printf("Returning to menu in %d seconds", (int)remaining);
+  }
+}
+
+void displayScanComplete() {
+  static bool displayed = false;
+  static unsigned long lastUpdate = 0;
+  
+  // Redraw if forced or not displayed
+  if (!displayed || forceRedraw) {
+    displayed = true;
+    if (forceRedraw) forceRedraw = false; // Clear the force redraw flag
+    
+    tft.fillScreen(TFT_WHITE);
+    
+    // Header
+    tft.fillRect(0, 0, SCREEN_WIDTH, 40, TFT_DARKGREEN);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(40, 15);
+    tft.println("SCAN COMPLETE!");
+    
+    int y = 60;
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_DARKGREEN);
+    tft.setCursor(70, y);
+    tft.println("DONE!");
+    
+    y += 40;
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_BLACK);
+    
+    // Different messages based on results
+    if (detectedCodes.size() > 0) {
+      // Issues found
+      tft.setCursor(10, y);
+      tft.println("Report with " + String(detectedCodes.size()) + " issue(s)");
+      y += 15;
+      tft.setCursor(10, y);
+      tft.println("being sent to your email.");
+      y += 30;
+      
+      tft.setTextColor(TFT_ORANGE);
+      tft.setCursor(10, y);
+      tft.println("Please review the detailed");
+      y += 15;
+      tft.setCursor(10, y);
+      tft.println("analysis and recommendations.");
+      
+    } else if (vehicleDetected) {
+      // Vehicle healthy
+      tft.setCursor(10, y);
+      tft.println("Vehicle health report");
+      y += 15;
+      tft.setCursor(10, y);
+      tft.println("being sent to your email.");
+      y += 30;
+      
+      tft.setTextColor(TFT_DARKGREEN);
+      tft.setCursor(10, y);
+      tft.println("Your vehicle is running");
+      y += 15;
+      tft.setCursor(10, y);
+      tft.println("in excellent condition!");
+      
+    } else {
+      // No vehicle detected
+      tft.setCursor(10, y);
+      tft.println("Please ensure OBD2 cable");
+      y += 15;
+      tft.setCursor(10, y);
+      tft.println("is properly connected.");
+    }
+    
+    // Disconnection instructions
+    y = SCREEN_HEIGHT - 65;
+    tft.setTextColor(TFT_NAVY);
+    tft.setCursor(10, y);
+    tft.println("Please disconnect OBD2 cable");
+    y += 15;
+    tft.setCursor(10, y);
+    tft.println("from your vehicle.");
+    y += 20;
+    tft.setCursor(10, y);
+    tft.println("Thank you for using OBD2Ai!");
+    
+    Serial.println("📺 Scan completion screen displayed");
+  }
+  
+  // Update countdown every second
+  if (millis() - lastUpdate > 1000) {
+    lastUpdate = millis();
+    
+    // Calculate remaining time
+    unsigned long elapsed = millis() - stateStartTime;
+    unsigned long remaining = (15000 > elapsed) ? (15000 - elapsed) / 1000 : 0;
+    
+    // Update countdown at bottom
+    tft.fillRect(10, SCREEN_HEIGHT - 15, SCREEN_WIDTH - 20, 15, TFT_WHITE);
+    tft.setTextColor(TFT_DARKGREY);
+    tft.setTextSize(1);
+    tft.setCursor(10, SCREEN_HEIGHT - 12);
+    tft.printf("Ready for next customer in %d", (int)remaining);
   }
 }
 
@@ -1233,6 +1437,7 @@ void resetToReady() {
   detectedCodes.clear();
   activeECUs.clear();
   vehicleDetected = false; // Reset vehicle detection flag
+  scanRetryCount = 0; // Reset retry counter for new session
   
   // Reset display flags
   for (int i = 0; i < 10; i++) {
