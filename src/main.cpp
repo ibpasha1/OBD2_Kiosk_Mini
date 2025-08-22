@@ -60,6 +60,9 @@ unsigned long sessionStartTime = 0;
 unsigned long lastPaymentCheck = 0;
 int vehicleDetectionAttempt = 0;
 
+// TEST MODE - Set to true to bypass QR/payment and go straight to scanning
+bool TEST_MODE = true;  // Set to false for production kiosk mode
+
 // Display state tracking (to prevent redundant redraws)
 bool screenDrawFlags[10] = {false}; // One for each state
 bool forceRedraw = false; // Global flag to force all displays to redraw
@@ -68,15 +71,18 @@ bool forceRedraw = false; // Global flag to force all displays to redraw
 const unsigned long SESSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const unsigned long PAYMENT_POLL_INTERVAL = 3000; // 3 seconds
 
-// Diagnostic scan timeouts
-const unsigned long TOTAL_SCAN_TIMEOUT_MS = 45 * 1000; // 45 seconds max scan time
-const unsigned long BAUD_DETECT_TIMEOUT_MS = 2000;     // 2 seconds per baud rate
-const unsigned long TRAFFIC_LISTEN_TIMEOUT_MS = 5000;  // 5 seconds listening
-const unsigned long ECU_PROBE_TIMEOUT_MS = 15000;      // 15 seconds probing ECUs
+// Diagnostic scan timeouts - Extended for comprehensive scanning
+const unsigned long TOTAL_SCAN_TIMEOUT_MS = 90 * 1000; // 90 seconds max scan time
+const unsigned long BAUD_DETECT_TIMEOUT_MS = 3000;     // 3 seconds per baud rate
+const unsigned long TRAFFIC_LISTEN_TIMEOUT_MS = 8000;  // 8 seconds listening
+const unsigned long ECU_PROBE_TIMEOUT_MS = 20000;      // 20 seconds probing ECUs
+const unsigned long DTC_SCAN_TIMEOUT_MS = 30000;       // 30 seconds for DTC scanning
 
 // WiFi and API configuration
 const char* WIFI_SSID     = "Pasha";
 const char* WIFI_PASSWORD = "E38740i!";
+// const char* WIFI_SSID     = "Ibrahim";
+// const char* WIFI_PASSWORD = "Newdad123!";
 const char* API_BASE_URL  = "https://obd2ai-server-1afd74c5766a.herokuapp.com";
 const char* WEBAPP_URL    = "https://obd2ai-webapp-805f8e39122c.herokuapp.com";
 const char* KIOSK_ID      = "DEMO_KIOSK";
@@ -114,6 +120,32 @@ void updateKioskState();
 void handleSessionTimeout();
 String createNewSession();
 bool checkPaymentStatus();
+bool submitDiagnosticResults();
+
+// Enhanced OBD2 Protocol Detection
+typedef enum {
+  OBD2_PROTOCOL_NONE = 0,
+  OBD2_PROTOCOL_CAN_11BIT_500K,
+  OBD2_PROTOCOL_CAN_11BIT_250K,
+  OBD2_PROTOCOL_CAN_29BIT_500K,
+  OBD2_PROTOCOL_CAN_29BIT_250K,
+  OBD2_PROTOCOL_ISO9141,
+  OBD2_PROTOCOL_KWP2000
+} obd2_protocol_t;
+
+struct OBD2ProtocolInfo {
+  obd2_protocol_t protocol;
+  uint32_t baudRate;
+  bool extendedId;
+  uint32_t broadcastId;
+  String name;
+};
+
+obd2_protocol_t detectOBD2Protocol();
+bool testProtocol(OBD2ProtocolInfo* protocolInfo);
+bool sendOBD2Handshake(uint32_t address, bool extended);
+void scanWithBroadcastAddress(uint32_t broadcastId, bool extended);
+void scanHondaSpecificDTCs(bool extended);
 
 // Display Functions (adapted for 240x320)
 void displayReadyScreen();
@@ -166,18 +198,42 @@ void setup() {
   // Setup button (keeping for potential manual override)
   pinMode(SCAN_BUTTON, INPUT_PULLUP);
   
-  // Create session immediately on boot and show QR code
-  Serial.println("🚀 Boot-to-scan mode: Creating session automatically...");
-  transactionId = createNewSession();
-  
-  if (transactionId.length() > 0) {
-    currentState = DISPLAY_QR;
+  // Check if TEST MODE is enabled
+  if (TEST_MODE) {
+    Serial.println("🧪 TEST MODE ENABLED - Bypassing QR/payment process");
+    Serial.println("   Going directly to scanning mode for development/testing");
+    transactionId = "TEST_MODE_" + String(millis());
+    currentState = READY_TO_SCAN;
     sessionStartTime = millis();
-    Serial.println("✓ Session created on boot: " + transactionId);
-    Serial.println("✓ QR code will be displayed immediately");
+    Serial.println("✓ TEST mode initialized, ready to scan immediately");
   } else {
-    Serial.println("❌ Failed to create session on boot, falling back to ready screen");
-    currentState = READY_SCREEN;
+    // Normal kiosk mode - Create session immediately on boot with retry logic
+    Serial.println("🚀 Boot-to-scan mode: Creating session automatically...");
+    
+    // Try to create session with retries
+    int retryCount = 0;
+    while (retryCount < 3 && transactionId.length() == 0) {
+      if (retryCount > 0) {
+        Serial.printf("🔄 Retry %d/3: Attempting to create session...\n", retryCount);
+        delay(2000); // Wait 2 seconds between retries
+      }
+      
+      transactionId = createNewSession();
+      retryCount++;
+    }
+    
+    if (transactionId.length() > 0) {
+      currentState = DISPLAY_QR;
+      sessionStartTime = millis();
+      lastPaymentCheck = millis(); // Initialize payment polling
+      Serial.println("✓ Session created on boot: " + transactionId);
+      Serial.println("✓ QR code will be displayed immediately");
+    } else {
+      Serial.println("❌ Failed to create session after 3 attempts");
+      Serial.println("❌ WiFi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
+      Serial.println("⏰ Will retry session creation in main loop...");
+      currentState = READY_SCREEN; // Fallback, but will retry in loop
+    }
   }
   
   stateStartTime = millis();
@@ -256,17 +312,37 @@ void updateKioskState() {
   switch (currentState) {
     case READY_SCREEN:
       displayReadyScreen();
+      
+      // If we're in ready screen but should be in QR mode, try to create session
+      if (transactionId.length() == 0 && WiFi.status() == WL_CONNECTED) {
+        static unsigned long lastRetryAttempt = 0;
+        if (millis() - lastRetryAttempt > 10000) { // Try every 10 seconds
+          Serial.println("🔄 Attempting to create session from ready screen...");
+          transactionId = createNewSession();
+          
+          if (transactionId.length() > 0) {
+            Serial.println("✅ Session created successfully, switching to QR mode");
+            currentState = DISPLAY_QR;
+            sessionStartTime = millis();
+            stateStartTime = millis();
+            lastPaymentCheck = millis(); // Initialize payment polling
+          }
+          lastRetryAttempt = millis();
+        }
+      }
       break;
       
     case DISPLAY_QR:
       displayQRCode();
-      // Give customer plenty of time to scan QR code and complete payment
-      // Transition to payment polling after a longer delay to ensure QR is visible
-      if (millis() - stateStartTime > 30000) { // 30 seconds to scan QR and start payment
-        currentState = WAITING_PAYMENT;
-        lastPaymentCheck = millis(); // Initialize payment polling
-        stateStartTime = millis();
-        Serial.println("⏰ Transitioning to payment waiting mode (customer has had time to scan)...");
+      // Check payment status while showing QR code - no automatic transition
+      if (millis() - lastPaymentCheck > PAYMENT_POLL_INTERVAL) {
+        lastPaymentCheck = millis();
+        if (checkPaymentStatus()) {
+          Serial.println("✅ Payment confirmed! Preparing for vehicle scan...");
+          currentState = PREPARE_VEHICLE;  // Give user time to prepare vehicle
+          sessionStartTime = millis();
+          stateStartTime = millis();
+        }
       }
       break;
       
@@ -310,6 +386,15 @@ void updateKioskState() {
     case SCANNING:
       displayScanning();
       performDiagnosticScan();
+      
+      // Submit diagnostic results to database for AI analysis and email
+      Serial.println("📤 Submitting diagnostic results to server...");
+      if (submitDiagnosticResults()) {
+        Serial.println("✅ Diagnostic results submitted successfully");
+      } else {
+        Serial.println("❌ Failed to submit diagnostic results");
+      }
+      
       currentState = DISPLAY_RESULTS;
       stateStartTime = millis();
       break;
@@ -332,6 +417,8 @@ void updateKioskState() {
             currentState = SCAN_COMPLETE;
             stateStartTime = millis();
             Serial.println("➡️ Transitioning to scan completion screen");
+            Serial.println("🔍 DEBUG: vehicleDetected=" + String(vehicleDetected ? "true" : "false"));
+            Serial.println("🔍 DEBUG: detectedCodes.size()=" + String(detectedCodes.size()));
           }
         }
       }
@@ -392,6 +479,7 @@ void handleButtonPress() {
           Serial.println("✅ Session created successfully: " + transactionId);
           currentState = DISPLAY_QR;
           stateStartTime = millis();
+          lastPaymentCheck = millis(); // Initialize payment polling
         } else {
           Serial.println("❌ Session creation failed, using offline test mode");
           transactionId = "OFFLINE_" + String(millis());
@@ -483,6 +571,76 @@ bool checkPaymentStatus() {
   return false;
 }
 
+bool submitDiagnosticResults() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ No WiFi connection for results submission");
+    return false;
+  }
+  
+  if (transactionId.length() == 0) {
+    Serial.println("❌ No transaction ID for results submission");
+    return false;
+  }
+  
+  Serial.println("📡 Submitting diagnostic results to API...");
+  
+  HTTPClient http;
+  http.setTimeout(10000);  // 10 second timeout for results submission
+  String endpoint = String(API_BASE_URL) + "/api/obd2/kiosk/" + KIOSK_ID + "/session/" + transactionId + "/results";
+  http.begin(endpoint);
+  http.addHeader("Content-Type", "application/json");
+  
+  // Create JSON payload with diagnostic results
+  DynamicJsonDocument doc(2048);  // Larger buffer for diagnostic data
+  
+  // Add fault codes array
+  JsonArray faultCodesArray = doc.createNestedArray("faultCodes");
+  for (const auto& code : detectedCodes) {
+    JsonObject faultObj = faultCodesArray.createNestedObject();
+    faultObj["code"] = code.code;
+    faultObj["system"] = code.system;
+  }
+  
+  // Add vehicle info (this will be merged with payment data on server)
+  JsonObject vehicleInfo = doc.createNestedObject("vehicleInfo");
+  vehicleInfo["ecuCount"] = activeECUs.size();
+  vehicleInfo["vehicleDetected"] = vehicleDetected;
+  vehicleInfo["scanTimestamp"] = millis();
+  
+  // Add basic AI analysis summary (server will do full AI processing)
+  String basicAnalysis;
+  if (detectedCodes.size() > 0) {
+    basicAnalysis = "ESP32 scan detected " + String(detectedCodes.size()) + " fault code(s). ";
+  } else if (vehicleDetected) {
+    basicAnalysis = "ESP32 scan completed successfully. No fault codes detected. Vehicle systems appear healthy. ";
+  } else {
+    basicAnalysis = "ESP32 scan could not detect vehicle. Please ensure OBD2 cable is connected and ignition is on. ";
+  }
+  basicAnalysis += "Full AI analysis and professional report will be generated server-side.";
+  doc["aiAnalysis"] = basicAnalysis;
+  
+  String requestBody;
+  serializeJson(doc, requestBody);
+  
+  Serial.println("📤 Sending diagnostic results:");
+  Serial.println("   Fault codes: " + String(detectedCodes.size()));
+  Serial.println("   Active ECUs: " + String(activeECUs.size()));
+  Serial.println("   Vehicle detected: " + String(vehicleDetected ? "Yes" : "No"));
+  
+  int httpCode = http.POST(requestBody);
+  String response = http.getString();
+  http.end();
+  
+  Serial.println("📥 Results response code: " + String(httpCode));
+  if (httpCode != 201 && httpCode != 200) {
+    Serial.println("📥 Error response: " + response);
+    return false;
+  }
+  
+  Serial.println("✅ Diagnostic results submitted - AI analysis and email will be processed");
+  return true;
+}
+
 // ========== DISPLAY FUNCTIONS (Adapted for 240x320) ==========
 void displayReadyScreen() {
   static bool displayed = false;
@@ -533,33 +691,66 @@ void displayReadyScreen() {
 
 void displayQRCode() {
   static bool displayed = false;
-  if (displayed) return;
-  displayed = true;
+  static unsigned long lastPaymentCheckDisplay = 0;
   
-  tft.fillScreen(TFT_WHITE);
+  // Only redraw the static parts once
+  if (!displayed) {
+    displayed = true;
+    
+    tft.fillScreen(TFT_WHITE);
+    
+    // Header
+    tft.fillRect(0, 0, SCREEN_WIDTH, 40, TFT_BLUE);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(60, 15);
+    tft.println("SCAN QR CODE");
+    
+    // QR Code (use short URL to trigger router redirect with token)
+    String qrData = String(WEBAPP_URL) + "/" + transactionId;
+    drawQRCode(qrData, 30, 70, 3); // Version 6 QR codes are larger, use smaller scale
+    
+    // Instructions 
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_BLACK);
+    tft.setCursor(20, 220);
+    tft.println("1. Scan QR with phone");
+    tft.setCursor(20, 235);
+    tft.println("2. Complete payment");
+    tft.setCursor(20, 250);
+    tft.println("3. Return to kiosk");
+    
+    Serial.println("📺 QR code displayed: " + qrData);
+  }
   
-  // Header
-  tft.fillRect(0, 0, SCREEN_WIDTH, 40, TFT_BLUE);
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE);
-  tft.setCursor(60, 15);
-  tft.println("SCAN QR CODE");
-  
-  // QR Code (use short URL to trigger router redirect with token)
-  String qrData = String(WEBAPP_URL) + "/" + transactionId;
-  drawQRCode(qrData, 30, 70, 3); // Version 6 QR codes are larger, use smaller scale
-  
-  // Instructions (moved down for larger QR code)
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_BLACK);
-  tft.setCursor(20, 260);
-  tft.println("1. Scan QR with phone");
-  tft.setCursor(20, 275);
-  tft.println("2. Complete payment");
-  tft.setCursor(20, 290);
-  tft.println("3. Return to kiosk");
-  
-  Serial.println("📺 QR code displayed: " + qrData);
+  // Update payment status indicator every 2 seconds
+  if (millis() - lastPaymentCheckDisplay > 2000) {
+    lastPaymentCheckDisplay = millis();
+    
+    // Clear status area and show waiting message
+    tft.fillRect(0, 270, SCREEN_WIDTH, 50, TFT_WHITE);
+    
+    // Show payment status
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_ORANGE);
+    tft.setCursor(20, 275);
+    tft.println("Waiting for payment...");
+    
+    // Show elapsed time
+    unsigned long elapsed = (millis() - stateStartTime) / 1000;
+    tft.setTextColor(TFT_DARKGREY);
+    tft.setCursor(20, 290);
+    tft.printf("Time: %02d:%02d", (int)(elapsed / 60), (int)(elapsed % 60));
+    
+    // Add animated dots
+    static int dots = 0;
+    tft.setCursor(20, 305);
+    tft.setTextColor(TFT_BLUE);
+    for (int i = 0; i < (dots % 4); i++) {
+      tft.print(".");
+    }
+    dots++;
+  }
 }
 
 void displayPaymentLoading() {
@@ -613,24 +804,51 @@ void displayReadyToScan(bool fullRedraw) {
   if (displayed && !fullRedraw) return;
   displayed = true;
   
-  tft.fillScreen(TFT_GREEN);
-  
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_WHITE);
-  tft.setCursor(40, 100);
-  tft.println("PAYMENT");
-  tft.setCursor(50, 130);
-  tft.println("SUCCESS");
-  
-  tft.setTextSize(1);
-  tft.setCursor(20, 180);
-  tft.println("Connect OBD2 cable to");
-  tft.setCursor(20, 195);
-  tft.println("your vehicle's port");
-  tft.setCursor(20, 210);
-  tft.println("Press button to scan");
-  
-  Serial.println("📺 Ready to scan displayed");
+  if (TEST_MODE) {
+    // TEST MODE display
+    tft.fillScreen(TFT_ORANGE);
+    
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_BLACK);
+    tft.setCursor(40, 80);
+    tft.println("TEST MODE");
+    
+    tft.setTextSize(1);
+    tft.setCursor(20, 120);
+    tft.println("Development/Testing Mode");
+    tft.setCursor(20, 140);
+    tft.println("Bypassing payment process");
+    
+    tft.setTextSize(1);
+    tft.setCursor(20, 180);
+    tft.println("Connect OBD2 cable to");
+    tft.setCursor(20, 195);
+    tft.println("your vehicle's port");
+    tft.setCursor(20, 210);
+    tft.println("Press button to scan");
+    
+    Serial.println("📺 TEST MODE ready to scan displayed");
+  } else {
+    // Normal kiosk mode display
+    tft.fillScreen(TFT_GREEN);
+    
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(40, 100);
+    tft.println("PAYMENT");
+    tft.setCursor(50, 130);
+    tft.println("SUCCESS");
+    
+    tft.setTextSize(1);
+    tft.setCursor(20, 180);
+    tft.println("Connect OBD2 cable to");
+    tft.setCursor(20, 195);
+    tft.println("your vehicle's port");
+    tft.setCursor(20, 210);
+    tft.println("Press button to scan");
+    
+    Serial.println("📺 Ready to scan displayed");
+  }
 }
 
 void displayPrepareVehicle() {
@@ -834,13 +1052,13 @@ void displayScanComplete() {
     tft.setCursor(40, 15);
     tft.println("SCAN COMPLETE!");
     
-    int y = 60;
+    int y = 50;
     tft.setTextSize(2);
     tft.setTextColor(TFT_DARKGREEN);
     tft.setCursor(70, y);
     tft.println("DONE!");
     
-    y += 40;
+    y += 35;
     tft.setTextSize(1);
     tft.setTextColor(TFT_BLACK);
     
@@ -886,15 +1104,16 @@ void displayScanComplete() {
       tft.println("is properly connected.");
     }
     
-    // Disconnection instructions
-    y = SCREEN_HEIGHT - 65;
+    // Disconnection instructions - ensure they're visible and don't conflict with countdown
+    y += 15; // Add space after previous content
     tft.setTextColor(TFT_NAVY);
+    tft.setTextSize(1);
     tft.setCursor(10, y);
     tft.println("Please disconnect OBD2 cable");
-    y += 15;
+    y += 12;
     tft.setCursor(10, y);
     tft.println("from your vehicle.");
-    y += 20;
+    y += 15;
     tft.setCursor(10, y);
     tft.println("Thank you for using OBD2Ai!");
     
@@ -909,12 +1128,12 @@ void displayScanComplete() {
     unsigned long elapsed = millis() - stateStartTime;
     unsigned long remaining = (15000 > elapsed) ? (15000 - elapsed) / 1000 : 0;
     
-    // Update countdown at bottom
-    tft.fillRect(10, SCREEN_HEIGHT - 15, SCREEN_WIDTH - 20, 15, TFT_WHITE);
+    // Update countdown at bottom - only clear the countdown area
+    tft.fillRect(10, SCREEN_HEIGHT - 20, SCREEN_WIDTH - 20, 20, TFT_WHITE);
     tft.setTextColor(TFT_DARKGREY);
     tft.setTextSize(1);
-    tft.setCursor(10, SCREEN_HEIGHT - 12);
-    tft.printf("Ready for next customer in %d", (int)remaining);
+    tft.setCursor(10, SCREEN_HEIGHT - 15);
+    tft.printf("Next customer ready in %ds", (int)remaining);
   }
 }
 
@@ -953,7 +1172,8 @@ void drawQRCode(String data, int x, int y, int scale) {
 
 // ========== REAL CAN BUS SCANNING ==========
 void performDiagnosticScan() {
-  Serial.println("🔍 Starting REAL CAN bus diagnostic scan...");
+  Serial.println("🔍 PROFESSIONAL OBD2 DIAGNOSTIC SCAN");
+  Serial.println("   Implementing commercial scan tool methodology...");
   unsigned long scanStartTime = millis();
   
   detectedCodes.clear();
@@ -961,12 +1181,12 @@ void performDiagnosticScan() {
   vehicleDetected = false; // Reset vehicle detection flag
   
   // Update display with progress
-  updateScanProgress("Detecting vehicle...", 0);
+  updateScanProgress("Detecting protocol...", 0);
   
-  // Step 1: Auto-detect CAN baud rate
-  uint32_t detectedBaudRate = autoDetectCANBaudRate();
-  if (detectedBaudRate == 0) {
-    Serial.println("❌ No CAN activity detected on any baud rate");
+  // Step 1: Professional Protocol Detection
+  obd2_protocol_t detectedProtocol = detectOBD2Protocol();
+  if (detectedProtocol == OBD2_PROTOCOL_NONE) {
+    Serial.println("❌ No OBD2 protocol detected");
     updateScanProgress("No vehicle detected", 100);
     delay(3000); // Show message for 3 seconds
     return;
@@ -980,31 +1200,60 @@ void performDiagnosticScan() {
     return;
   }
   
-  Serial.printf("✅ CAN activity detected at %d bps\n", detectedBaudRate);
+  // Get protocol details for broadcast scanning
+  OBD2ProtocolInfo detectedProtocolInfo;
+  switch (detectedProtocol) {
+    case OBD2_PROTOCOL_CAN_11BIT_500K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_11BIT_500K, 500000, false, 0x7DF, "CAN 11-bit 500kbps"};
+      break;
+    case OBD2_PROTOCOL_CAN_11BIT_250K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_11BIT_250K, 250000, false, 0x7DF, "CAN 11-bit 250kbps"};
+      break;
+    case OBD2_PROTOCOL_CAN_29BIT_500K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_29BIT_500K, 500000, true, 0x18DB33F1, "CAN 29-bit 500kbps"};
+      break;
+    case OBD2_PROTOCOL_CAN_29BIT_250K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_29BIT_250K, 250000, true, 0x18DB33F1, "CAN 29-bit 250kbps"};
+      break;
+    default:
+      Serial.println("❌ Unsupported protocol detected");
+      return;
+  }
+  
+  Serial.printf("✅ Protocol confirmed: %s\n", detectedProtocolInfo.name.c_str());
   vehicleDetected = true; // Vehicle was successfully detected!
   updateScanProgress("Vehicle found! Analyzing...", 25);
   
-  // Step 2: Listen for existing CAN traffic
-  Serial.println("📡 Listening for existing CAN traffic...");
-  listenForCANTraffic(TRAFFIC_LISTEN_TIMEOUT_MS);
-  updateScanProgress("Reading vehicle data...", 50);
-  
-  // Check timeout again
+  // Check timeout
   if (millis() - scanStartTime > TOTAL_SCAN_TIMEOUT_MS) {
-    Serial.println("⏰ Scan timeout reached during traffic analysis");
+    Serial.println("⏰ Scan timeout reached during protocol detection");
     updateScanProgress("Scan timeout", 100);
     delay(2000);
     return;
   }
   
-  // Step 3: Actively probe for OBD2 responses
-  Serial.println("🔍 Probing for OBD2 ECU responses...");
-  probeOBD2ECUsWithTimeout(ECU_PROBE_TIMEOUT_MS);
-  updateScanProgress("Checking systems...", 75);
+  // Step 2: Professional Broadcast Scanning
+  Serial.println("📡 BROADCAST SCANNING - Querying all ECUs...");
+  updateScanProgress("Broadcasting queries...", 50);
+  scanWithBroadcastAddress(detectedProtocolInfo.broadcastId, detectedProtocolInfo.extendedId);
+  updateScanProgress("Collecting responses...", 75);
   
-  // Step 4: Scan for DTCs on active ECUs
-  Serial.println("🚨 Scanning for diagnostic trouble codes...");
-  scanAllDTCs();
+  // Step 3: Honda-specific additional DTC scanning if needed
+  if (detectedCodes.size() == 0) {
+    Serial.println("🚨 No DTCs from broadcast - trying Honda-specific methods...");
+    Serial.println("   Honda vehicles may need individual ECU queries...");
+    
+    // Try individual ECU scanning with Honda-friendly timing
+    updateScanProgress("Honda-specific scan...", 80);
+    scanHondaSpecificDTCs(detectedProtocolInfo.extendedId);
+    
+    // If still no DTCs, try comprehensive scan
+    if (detectedCodes.size() == 0) {
+      Serial.println("   Falling back to comprehensive scan...");
+      scanAllDTCs();
+    }
+  }
+  
   updateScanProgress("Scan complete!", 100);
   
   unsigned long scanDuration = millis() - scanStartTime;
@@ -1086,14 +1335,388 @@ void parseAndStoreDTC(uint8_t* data, int len, uint16_t ecuId) {
     
     FaultCode fault;
     fault.code = dtcCode;
-    fault.system = "ECU 0x" + String(ecuId, HEX);
-    fault.isPending = false;
     fault.ecuId = ecuId;
+    fault.isPending = false;
+    
+    // Add better system description based on DTC code
+    if (dtcCode.startsWith("P0")) {
+      fault.system = "Engine/Powertrain";
+    } else if (dtcCode.startsWith("P1")) {
+      fault.system = "Fuel and Air Metering";
+    } else if (dtcCode.startsWith("P2")) {
+      fault.system = "Fuel and Air Metering (Injector Circuit)";
+    } else if (dtcCode.startsWith("P3")) {
+      fault.system = "Ignition System or Misfire";
+    } else if (dtcCode.startsWith("B")) {
+      fault.system = "Body Control";
+    } else if (dtcCode.startsWith("C")) {
+      fault.system = "Chassis";
+    } else if (dtcCode.startsWith("U")) {
+      fault.system = "Network/Communication";
+    } else {
+      fault.system = "Unknown System";
+    }
+    
+    // Add specific descriptions for common codes
+    if (dtcCode == "P0354") {
+      fault.system = "Ignition Coil D Primary/Secondary Circuit";
+    } else if (dtcCode == "P0301") {
+      fault.system = "Engine - Cylinder 1 Misfire Detected";
+    } else if (dtcCode == "P0420") {
+      fault.system = "Catalyst System Efficiency Below Threshold";
+    }
     
     detectedCodes.push_back(fault);
     
     Serial.printf("  🚨 DTC found: %s from ECU 0x%03X\n", dtcCode.c_str(), ecuId);
   }
+}
+
+// ========== ENHANCED OBD2 PROTOCOL DETECTION ==========
+obd2_protocol_t detectOBD2Protocol() {
+  Serial.println("🔍 PROFESSIONAL OBD2 PROTOCOL DETECTION");
+  Serial.println("   Using commercial scan tool methodology...");
+  
+  // Define supported OBD2 protocols in order of prevalence
+  OBD2ProtocolInfo protocols[] = {
+    {OBD2_PROTOCOL_CAN_11BIT_500K, 500000, false, 0x7DF, "CAN 11-bit 500kbps"},
+    {OBD2_PROTOCOL_CAN_11BIT_250K, 250000, false, 0x7DF, "CAN 11-bit 250kbps"},
+    {OBD2_PROTOCOL_CAN_29BIT_500K, 500000, true,  0x18DB33F1, "CAN 29-bit 500kbps"},
+    {OBD2_PROTOCOL_CAN_29BIT_250K, 250000, true,  0x18DB33F1, "CAN 29-bit 250kbps"}
+  };
+  
+  int numProtocols = sizeof(protocols) / sizeof(protocols[0]);
+  
+  for (int i = 0; i < numProtocols; i++) {
+    Serial.printf("📡 Testing Protocol: %s\n", protocols[i].name.c_str());
+    
+    if (testProtocol(&protocols[i])) {
+      Serial.printf("✅ PROTOCOL DETECTED: %s\n", protocols[i].name.c_str());
+      Serial.printf("   Broadcast ID: 0x%08X\n", protocols[i].broadcastId);
+      Serial.printf("   Extended ID: %s\n", protocols[i].extendedId ? "Yes" : "No");
+      return protocols[i].protocol;
+    }
+  }
+  
+  Serial.println("❌ No OBD2 protocol detected");
+  return OBD2_PROTOCOL_NONE;
+}
+
+bool testProtocol(OBD2ProtocolInfo* protocolInfo) {
+  // Initialize CAN with protocol specifications
+  if (!reinitializeCAN(protocolInfo->baudRate)) {
+    Serial.printf("   ❌ Failed to initialize CAN at %d bps\n", protocolInfo->baudRate);
+    return false;
+  }
+  
+  Serial.printf("   🔧 CAN initialized: %d bps, Extended: %s\n", 
+                protocolInfo->baudRate, protocolInfo->extendedId ? "Yes" : "No");
+  
+  // Step 1: Listen for existing traffic
+  Serial.println("   👂 Listening for existing CAN traffic...");
+  unsigned long startTime = millis();
+  int frameCount = 0;
+  
+  while (millis() - startTime < 2000) { // 2 second listen
+    twai_message_t message;
+    if (twai_receive(&message, pdMS_TO_TICKS(50)) == ESP_OK) {
+      frameCount++;
+      
+      // Check if frame matches expected ID format
+      bool validFrame = false;
+      if (!protocolInfo->extendedId && !message.extd) {
+        // 11-bit CAN - look for OBD2 response IDs (0x7E8-0x7EF)
+        validFrame = (message.identifier >= 0x7E8 && message.identifier <= 0x7EF);
+      } else if (protocolInfo->extendedId && message.extd) {
+        // 29-bit CAN - look for ISO-TP response format
+        validFrame = ((message.identifier & 0xFFFF0000) == 0x18DA0000);
+      }
+      
+      if (validFrame) {
+        Serial.printf("   ✅ Valid OBD2 frame detected: ID=0x%08X\n", message.identifier);
+        return true;
+      }
+    }
+  }
+  
+  Serial.printf("   📊 Heard %d frames, but none were OBD2 responses\n", frameCount);
+  
+  // Step 2: Send handshake to broadcast address
+  Serial.printf("   🤝 Sending OBD2 handshake to broadcast 0x%08X...\n", protocolInfo->broadcastId);
+  
+  if (sendOBD2Handshake(protocolInfo->broadcastId, protocolInfo->extendedId)) {
+    Serial.println("   ✅ OBD2 handshake successful!");
+    return true;
+  }
+  
+  Serial.println("   ❌ No response to OBD2 handshake");
+  return false;
+}
+
+bool sendOBD2Handshake(uint32_t address, bool extended) {
+  twai_message_t msg;
+  msg.identifier = address;
+  msg.extd = extended ? 1 : 0;
+  msg.rtr = 0;
+  msg.data_length_code = 8;
+  
+  // Mode 01 PID 00 - Request supported PIDs (universal handshake)
+  msg.data[0] = 0x02;  // Length
+  msg.data[1] = 0x01;  // Mode 01 (Show current data)
+  msg.data[2] = 0x00;  // PID 00 (Supported PIDs 01-20)
+  msg.data[3] = 0x00;  // Padding
+  msg.data[4] = 0x00;
+  msg.data[5] = 0x00;
+  msg.data[6] = 0x00;
+  msg.data[7] = 0x00;
+  
+  // Send handshake
+  if (twai_transmit(&msg, pdMS_TO_TICKS(100)) != ESP_OK) {
+    Serial.println("   ❌ Failed to send handshake");
+    return false;
+  }
+  
+  // Wait for any ECU to respond
+  unsigned long startTime = millis();
+  while (millis() - startTime < 1000) { // 1 second timeout
+    twai_message_t response;
+    if (twai_receive(&response, pdMS_TO_TICKS(50)) == ESP_OK) {
+      
+      // Check if this looks like an OBD2 response
+      bool validResponse = false;
+      
+      if (!extended && !response.extd) {
+        // 11-bit: Response should be 0x7E8-0x7EF
+        validResponse = (response.identifier >= 0x7E8 && response.identifier <= 0x7EF);
+      } else if (extended && response.extd) {
+        // 29-bit: Response should follow ISO-TP format
+        validResponse = ((response.identifier & 0xFFFF0000) == 0x18DA0000);
+      }
+      
+      if (validResponse && response.data_length_code >= 3) {
+        // Check if response is Mode 01 PID 00 response (0x41 0x00 ...)
+        if (response.data[1] == 0x41 && response.data[2] == 0x00) {
+          Serial.printf("   ✅ Valid Mode 01 PID 00 response from 0x%08X\n", response.identifier);
+          Serial.printf("   📋 Supported PIDs: %02X %02X %02X %02X\n", 
+                        response.data[3], response.data[4], response.data[5], response.data[6]);
+          return true;
+        }
+      }
+    }
+  }
+  
+  return false;
+}
+
+void scanWithBroadcastAddress(uint32_t broadcastId, bool extended) {
+  Serial.printf("🔍 CONSERVATIVE BROADCAST SCAN to 0x%08X\n", broadcastId);
+  Serial.println("   Using Honda-compatible timing and prioritized queries...");
+  
+  // Prioritized queries - focus on DTC detection first (Honda-friendly approach)
+  struct {
+    uint8_t mode;
+    uint8_t pid;
+    const char* description;
+    int delayMs;  // Honda needs longer delays between queries
+  } standardQueries[] = {
+    {0x01, 0x00, "Supported PIDs 01-20", 500},        // Handshake first
+    {0x03, 0x00, "Stored emission DTCs", 1000},       // Priority #1 - stored DTCs  
+    {0x07, 0x00, "Pending emission DTCs", 1000},      // Priority #2 - pending DTCs
+    {0x01, 0x01, "Monitor status since DTCs cleared", 750},
+    {0x01, 0x03, "Fuel system status", 500},
+    {0x09, 0x00, "Vehicle information supported", 500},
+    {0x09, 0x02, "Vehicle identification number", 500}
+  };
+  
+  int numQueries = sizeof(standardQueries) / sizeof(standardQueries[0]);
+  
+  for (int i = 0; i < numQueries; i++) {
+    Serial.printf("📡 Broadcasting Mode %02X PID %02X: %s\n", 
+                  standardQueries[i].mode, standardQueries[i].pid, standardQueries[i].description);
+    
+    twai_message_t msg;
+    msg.identifier = broadcastId;
+    msg.extd = extended ? 1 : 0;
+    msg.rtr = 0;
+    msg.data_length_code = 8;
+    
+    // Format standard OBD2 request
+    if (standardQueries[i].pid == 0x00 && standardQueries[i].mode != 0x01) {
+      // Mode 03/07 - DTC requests don't use PID
+      msg.data[0] = 0x01;  // Length
+      msg.data[1] = standardQueries[i].mode;
+      msg.data[2] = 0x00;
+    } else {
+      // Standard Mode/PID request
+      msg.data[0] = 0x02;  // Length
+      msg.data[1] = standardQueries[i].mode;
+      msg.data[2] = standardQueries[i].pid;
+    }
+    
+    // Pad remaining bytes
+    for (int j = 3; j < 8; j++) {
+      msg.data[j] = 0x00;
+    }
+    
+    // Send broadcast query with Honda-compatible approach
+    Serial.printf("   📡 Sending query (waiting %dms after)...\n", standardQueries[i].delayMs);
+    if (twai_transmit(&msg, pdMS_TO_TICKS(200)) == ESP_OK) {
+      // Collect responses with longer timeout for Honda
+      unsigned long queryStart = millis();
+      int responseCount = 0;
+      
+      // Honda ECUs may need more time to respond, especially for DTC queries
+      int collectionTime = (standardQueries[i].mode == 0x03 || standardQueries[i].mode == 0x07) ? 3000 : 2000;
+      while (millis() - queryStart < collectionTime) {
+        twai_message_t response;
+        if (twai_receive(&response, pdMS_TO_TICKS(50)) == ESP_OK) {
+          
+          // Validate response format
+          bool validResponse = false;
+          if (!extended && !response.extd) {
+            // 11-bit responses from 0x7E8-0x7EF
+            validResponse = (response.identifier >= 0x7E8 && response.identifier <= 0x7EF);
+          } else if (extended && response.extd) {
+            // 29-bit ISO-TP responses
+            validResponse = ((response.identifier & 0xFFFF0000) == 0x18DA0000);
+          }
+          
+          if (validResponse && response.data_length_code >= 2) {
+            responseCount++;
+            vehicleDetected = true; // Mark vehicle as detected
+            
+            // Track active ECU
+            bool ecuKnown = false;
+            for (uint16_t ecu : activeECUs) {
+              if (ecu == response.identifier) {
+                ecuKnown = true;
+                break;
+              }
+            }
+            if (!ecuKnown) {
+              activeECUs.push_back(response.identifier);
+            }
+            
+            Serial.printf("   ✅ Response #%d from ECU 0x%08X: ", responseCount, response.identifier);
+            for (int j = 0; j < response.data_length_code; j++) {
+              Serial.printf("%02X ", response.data[j]);
+            }
+            Serial.println();
+            
+            // Parse DTC responses (Mode 03/07)
+            if ((standardQueries[i].mode == 0x03 || standardQueries[i].mode == 0x07) && 
+                response.data_length_code > 2) {
+              parseAndStoreDTC(response.data, response.data_length_code, response.identifier);
+            }
+          }
+        }
+      }
+      
+      Serial.printf("   📊 Query complete: %d ECU responses collected\n", responseCount);
+    } else {
+      Serial.printf("   ❌ Failed to send Mode %02X PID %02X query\n", 
+                    standardQueries[i].mode, standardQueries[i].pid);
+    }
+    
+    // Honda-specific delay between queries to prevent dashboard interference
+    delay(standardQueries[i].delayMs);
+  }
+  
+  Serial.printf("🎯 BROADCAST SCAN COMPLETE: %d active ECUs, %d DTCs\n", 
+                activeECUs.size(), detectedCodes.size());
+}
+
+void scanHondaSpecificDTCs(bool extended) {
+  Serial.println("🔧 HONDA-SPECIFIC DTC SCANNING");
+  Serial.println("   Using conservative timing and targeted ECU queries...");
+  
+  // Honda-specific ECU addresses (most common in 2018+ Honda vehicles)
+  uint16_t hondaECUs[] = {
+    0x7E0,  // Engine ECU (PCM) - most likely to have DTCs
+    0x7E1,  // Transmission ECU  
+    0x7E8,  // Engine responses
+    0x7E9,  // Common response address
+    0x7EA,  // Body control module
+    0x7EB   // Another common response
+  };
+  
+  int numHondaECUs = sizeof(hondaECUs) / sizeof(hondaECUs[0]);
+  
+  for (int i = 0; i < numHondaECUs; i++) {
+    uint16_t ecuAddr = hondaECUs[i];
+    Serial.printf("🔍 Honda ECU 0x%03X: Mode 03 DTC query...\n", ecuAddr);
+    
+    // Mode 03 - Stored DTCs (Honda priority)
+    twai_message_t msg;
+    msg.identifier = ecuAddr;
+    msg.extd = extended ? 1 : 0;
+    msg.rtr = 0;
+    msg.data_length_code = 8;
+    msg.data[0] = 0x01;  // Length
+    msg.data[1] = 0x03;  // Mode 03
+    msg.data[2] = 0x00;
+    msg.data[3] = 0x00;
+    msg.data[4] = 0x00;
+    msg.data[5] = 0x00;
+    msg.data[6] = 0x00;
+    msg.data[7] = 0x00;
+    
+    if (twai_transmit(&msg, pdMS_TO_TICKS(200)) == ESP_OK) {
+      // Honda ECUs may take longer to respond to DTC requests
+      unsigned long start = millis();
+      bool foundResponse = false;
+      
+      while (millis() - start < 3000 && !foundResponse) { // 3 second timeout per ECU
+        twai_message_t response;
+        if (twai_receive(&response, pdMS_TO_TICKS(100)) == ESP_OK) {
+          
+          // Look for valid Honda response
+          bool validResponse = false;
+          if (!extended && !response.extd) {
+            validResponse = (response.identifier >= 0x7E8 && response.identifier <= 0x7EF);
+          } else if (extended && response.extd) {
+            validResponse = ((response.identifier & 0xFFFF0000) == 0x18DA0000);
+          }
+          
+          if (validResponse) {
+            foundResponse = true;
+            
+            // Track active ECU
+            bool ecuKnown = false;
+            for (uint16_t ecu : activeECUs) {
+              if (ecu == response.identifier) {
+                ecuKnown = true;
+                break;
+              }
+            }
+            if (!ecuKnown) {
+              activeECUs.push_back(response.identifier);
+            }
+            
+            Serial.printf("   ✅ Honda ECU 0x%03X responded from 0x%03X: ", ecuAddr, response.identifier);
+            for (int j = 0; j < response.data_length_code; j++) {
+              Serial.printf("%02X ", response.data[j]);
+            }
+            Serial.println();
+            
+            // Parse DTC response
+            if (response.data_length_code > 2) {
+              parseAndStoreDTC(response.data, response.data_length_code, response.identifier);
+            }
+          }
+        }
+      }
+      
+      if (!foundResponse) {
+        Serial.printf("   ⚠️ No response from Honda ECU 0x%03X\n", ecuAddr);
+      }
+    }
+    
+    // Honda-specific: Longer delay between ECU queries to prevent interference
+    delay(750);  // 750ms between Honda ECU queries
+  }
+  
+  Serial.printf("🔧 HONDA SCAN COMPLETE: Found %d DTCs\n", detectedCodes.size());
 }
 
 // ========== REAL CAN BUS FUNCTIONS ==========
@@ -1219,17 +1842,24 @@ void listenForCANTraffic(uint32_t duration_ms) {
 void probeOBD2ECUs() {
   Serial.println("🔍 Actively probing for OBD2 ECUs...");
   
-  // Send standard OBD2 query to detect active ECUs
+  // Enhanced ECU probing with multiple methods
+  Serial.println("📡 Enhanced ECU probing with multiple detection methods...");
+  
   for (int i = 0; i < NUM_ECUS; i++) {
     uint16_t ecuAddr = OBD2_ADDRESSES[i];
     
-    Serial.printf("📡 Probing ECU 0x%03X (%d/%d)...\n", ecuAddr, i + 1, NUM_ECUS);
+    Serial.printf("📡 Probing ECU 0x%03X (%d/%d) with multiple methods...\n", ecuAddr, i + 1, NUM_ECUS);
     
-    // Send Mode 01 PID 00 (Supported PIDs) request
-    twai_message_t msg;
-    msg.identifier = ecuAddr;
-    msg.flags = TWAI_MSG_FLAG_NONE;
-    msg.data_length_code = 8;
+    bool ecuFound = false;
+    
+    // Method 1: Mode 01 PID 00 (Supported PIDs) - Most common
+    if (!ecuFound) {
+      Serial.printf("  Method 1: Mode 01 PID 00...\n");
+      
+      twai_message_t msg;
+      msg.identifier = ecuAddr;
+      msg.flags = TWAI_MSG_FLAG_NONE;
+      msg.data_length_code = 8;
     msg.data[0] = 0x02;  // Length
     msg.data[1] = 0x01;  // Mode 01 (Show current data)
     msg.data[2] = 0x00;  // PID 00 (Supported PIDs 01-20)
@@ -1264,6 +1894,7 @@ void probeOBD2ECUs() {
         }
       }
     }
+    }  // Close the if (!ecuFound) block
     
     delay(100); // Brief pause between requests
   }
@@ -1368,59 +1999,114 @@ void updateScanProgress(String message, int percentage) {
 }
 
 void scanAllDTCs() {
-  if (activeECUs.size() == 0) {
-    Serial.println("⚠️ No active ECUs found, skipping DTC scan");
-    return;
-  }
+  Serial.println("🚨 COMPREHENSIVE DTC SCAN - Multiple passes for maximum detection");
+  Serial.printf("   Active ECUs found during probe: %d\n", activeECUs.size());
+  Serial.println("   Performing 2-pass scan of all 16 standard OBD2 addresses...");
   
-  Serial.println("🚨 Scanning for Diagnostic Trouble Codes...");
+  unsigned long scanStart = millis();
+  int initialDTCCount = detectedCodes.size();
   
-  for (uint16_t ecuId : activeECUs) {
-    Serial.printf("🔍 Scanning ECU 0x%03X for DTCs...\n", ecuId);
+  // Perform 2 passes to catch intermittent codes
+  for (int pass = 1; pass <= 2; pass++) {
+    Serial.printf("\n🔄 DTC Scan Pass %d/2:\n", pass);
     
-    // Convert response ID back to request ID
-    uint16_t requestId = ecuId;
-    if (ecuId >= 0x7E8 && ecuId <= 0x7EF) {
-      requestId = ecuId - 8;
-    }
+    // Scan ALL standard OBD2 addresses for DTCs, not just activeECUs
+    // This ensures we don't miss codes like P0354 from ECUs that didn't respond to probes
+    for (int i = 0; i < NUM_ECUS; i++) {
+    uint16_t requestAddr = OBD2_ADDRESSES[i];
+    uint16_t responseAddr = requestAddr + 8; // Standard OBD2 response offset
     
-    // Send Mode 03 (Request stored DTCs)
-    twai_message_t msg;
-    msg.identifier = requestId;
-    msg.flags = TWAI_MSG_FLAG_NONE;
-    msg.data_length_code = 8;
-    msg.data[0] = 0x01;  // Length
-    msg.data[1] = 0x03;  // Mode 03 (Request stored DTCs)
-    msg.data[2] = 0x00;
-    msg.data[3] = 0x00;
-    msg.data[4] = 0x00;
-    msg.data[5] = 0x00;
-    msg.data[6] = 0x00;
-    msg.data[7] = 0x00;
+    Serial.printf("🔍 Scanning ECU 0x%03X → 0x%03X for DTCs...\n", requestAddr, responseAddr);
     
-    if (twai_transmit(&msg, pdMS_TO_TICKS(100)) == ESP_OK) {
-      // Wait for DTC response
-      unsigned long start = millis();
-      while (millis() - start < 1000) {
-        twai_message_t response;
-        if (twai_receive(&response, pdMS_TO_TICKS(50)) == ESP_OK) {
-          if (response.identifier == ecuId) {
-            Serial.printf("  📋 DTC Response from 0x%03X: ", ecuId);
-            for (int i = 0; i < response.data_length_code; i++) {
-              Serial.printf("%02X ", response.data[i]);
+    // Try both Mode 03 (stored DTCs) and Mode 07 (pending DTCs)
+    uint8_t modes[] = {0x03, 0x07};
+    const char* modeNames[] = {"stored", "pending"};
+    
+    for (int m = 0; m < 2; m++) {
+      Serial.printf("    Trying Mode %02X (%s DTCs)...\n", modes[m], modeNames[m]);
+      
+      twai_message_t msg;
+      msg.identifier = requestAddr;
+      msg.flags = TWAI_MSG_FLAG_NONE;
+      msg.data_length_code = 8;
+      msg.data[0] = 0x01;  // Length
+      msg.data[1] = modes[m];  // Mode 03 or 07
+      msg.data[2] = 0x00;
+      msg.data[3] = 0x00;
+      msg.data[4] = 0x00;
+      msg.data[5] = 0x00;
+      msg.data[6] = 0x00;
+      msg.data[7] = 0x00;
+      
+      if (twai_transmit(&msg, pdMS_TO_TICKS(100)) == ESP_OK) {
+        // Wait for DTC response
+        unsigned long start = millis();
+        bool foundResponse = false;
+        
+        while (millis() - start < 2000 && !foundResponse) { // Longer timeout for DTC responses
+          twai_message_t response;
+          if (twai_receive(&response, pdMS_TO_TICKS(50)) == ESP_OK) {
+            if (response.identifier == responseAddr) {
+              Serial.printf("    📋 Mode %02X Response from 0x%03X: ", modes[m], responseAddr);
+              for (int i = 0; i < response.data_length_code; i++) {
+                Serial.printf("%02X ", response.data[i]);
+              }
+              Serial.println();
+              
+              // Check if this is a positive response (not just "no DTCs")
+              if (response.data_length_code > 2 && !(response.data_length_code == 3 && response.data[2] == 0x00)) {
+                parseAndStoreDTC(response.data, response.data_length_code, responseAddr);
+              } else if (response.data_length_code == 3 && response.data[2] == 0x00) {
+                Serial.printf("    ✅ No %s DTCs in this ECU\n", modeNames[m]);
+              }
+              foundResponse = true;
             }
-            Serial.println();
-            
-            if (response.data_length_code > 2) {
-              parseAndStoreDTC(response.data, response.data_length_code, ecuId);
-            }
-            break;
           }
         }
+        
+        if (!foundResponse) {
+          Serial.printf("    ⚠️ No response to Mode %02X from ECU 0x%03X\n", modes[m], requestAddr);
+        }
+      } else {
+        Serial.printf("    ❌ Failed to send Mode %02X request to ECU 0x%03X\n", modes[m], requestAddr);
+      }
+      
+      delay(50); // Small delay between mode requests
+    }
+      
+      delay(100);
+      
+      // Check for timeout
+      if (millis() - scanStart > DTC_SCAN_TIMEOUT_MS) {
+        Serial.println("⏰ DTC scan timeout reached, stopping...");
+        break;
       }
     }
     
-    delay(100);
+    // Brief pause between passes
+    if (pass == 1) {
+      delay(500);
+      Serial.printf("✓ Pass %d complete, found %d new DTCs\n", pass, detectedCodes.size() - initialDTCCount);
+    }
+  }
+  
+  // Final summary
+  int totalDTCs = detectedCodes.size();
+  int newDTCs = totalDTCs - initialDTCCount;
+  unsigned long scanDuration = millis() - scanStart;
+  
+  Serial.printf("\n🏁 COMPREHENSIVE DTC SCAN COMPLETE:\n");
+  Serial.printf("   Duration: %.1f seconds\n", scanDuration / 1000.0);
+  Serial.printf("   Total DTCs found: %d\n", totalDTCs);
+  Serial.printf("   New DTCs this scan: %d\n", newDTCs);
+  
+  if (totalDTCs > 0) {
+    Serial.println("   Detected fault codes:");
+    for (const auto& code : detectedCodes) {
+      Serial.printf("   🚨 %s - %s\n", code.code.c_str(), code.system.c_str());
+    }
+  } else {
+    Serial.println("   ✅ No diagnostic trouble codes detected");
   }
 }
 
@@ -1453,6 +2139,7 @@ void resetToReady() {
   
   if (transactionId.length() > 0) {
     currentState = DISPLAY_QR;
+    lastPaymentCheck = millis(); // Initialize payment polling for new session
     Serial.println("✓ New session created: " + transactionId);
   } else {
     Serial.println("❌ Failed to create new session, showing ready screen");
