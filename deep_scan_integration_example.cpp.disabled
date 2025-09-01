@@ -1,0 +1,343 @@
+/*
+ * DEEP SCAN INTEGRATION EXAMPLE
+ * How to integrate experimental deep scan with your existing ESP32 code
+ * 
+ * IMPORTANT: This is an example - do not replace your working main.cpp!
+ * Use this as a reference for adding deep scan features to your kiosk.
+ * 
+ * NOTE: This file is excluded from compilation to prevent build conflicts.
+ */
+
+#ifdef COMPILE_DEEP_SCAN_EXAMPLES  // Only compile if explicitly enabled
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include "experimental_deep_scan.h"
+
+// Declare TFT object (would already exist in your main.cpp)
+extern TFT_eSPI tft;
+
+// Example of how to add deep scan to your existing kiosk states
+enum ExtendedKioskState {
+  // Your existing states...
+  READY_SCREEN,
+  SCANNING,
+  // New deep scan states
+  DEEP_SCAN_MENU,
+  BATTERY_HEALTH_SCAN,
+  OIL_LIFE_SCAN,
+  SENSOR_TEST_SCAN,
+  REAL_TIME_DATA_STREAM
+};
+
+// Global deep scan instance
+ExperimentalDeepScan deepScan;
+
+// ========== EXAMPLE INTEGRATION FUNCTIONS ==========
+
+void initializeDeepScan() {
+  Serial.println("🔬 Initializing Experimental Deep Scan Module");
+  
+  if (deepScan.initialize()) {
+    Serial.println("✅ Deep scan module ready");
+    
+    // Detect manufacturer for proprietary PIDs
+    if (deepScan.detectManufacturer()) {
+      Serial.println("🏭 Manufacturer detected: " + deepScan.getManufacturerName());
+    }
+  } else {
+    Serial.println("❌ Deep scan initialization failed");
+  }
+}
+
+void displayDeepScanMenu() {
+  // Example TFT menu display for deep scan options
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  
+  tft.drawString("DEEP SCAN MENU", 10, 20);
+  tft.setTextSize(1);
+  
+  tft.drawString("1. Battery Health", 10, 60);
+  tft.drawString("2. Oil Life Monitor", 10, 80);
+  tft.drawString("3. All Sensor Test", 10, 100);
+  tft.drawString("4. Real-time Data", 10, 120);
+  tft.drawString("5. TPMS Readings", 10, 140);
+  tft.drawString("6. ECU Deep Scan", 10, 160);
+  
+  tft.drawString("Press button to select", 10, 200);
+}
+
+void performBatteryHealthScan() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("BATTERY HEALTH SCAN", 10, 20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Reading battery data...", 10, 50);
+  
+  BatteryHealth battery = deepScan.getBatteryHealth();
+  
+  tft.fillRect(0, 70, 240, 150, TFT_BLACK);
+  
+  if (battery.health != "UNKNOWN") {
+    // Display battery health results
+    tft.drawString("State of Charge: " + String(battery.stateOfCharge, 1) + "%", 10, 80);
+    tft.drawString("Voltage: " + String(battery.voltage, 2) + "V", 10, 100);
+    tft.drawString("Temperature: " + String(battery.temperature, 1) + "C", 10, 120);
+    
+    // Color-code health status
+    uint16_t healthColor = TFT_GREEN;
+    if (battery.health == "POOR" || battery.health == "CRITICAL") healthColor = TFT_RED;
+    else if (battery.health == "FAIR") healthColor = TFT_YELLOW;
+    
+    tft.setTextColor(healthColor, TFT_BLACK);
+    tft.drawString("Health: " + battery.health, 10, 140);
+    
+    // Visual SOC bar
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Charge Level:", 10, 170);
+    tft.drawRect(10, 185, 200, 20, TFT_WHITE);
+    int barWidth = (battery.stateOfCharge / 100.0) * 198;
+    uint16_t barColor = (battery.stateOfCharge > 50) ? TFT_GREEN : 
+                       (battery.stateOfCharge > 20) ? TFT_YELLOW : TFT_RED;
+    tft.fillRect(11, 186, barWidth, 18, barColor);
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("Battery data not available", 10, 100);
+    tft.drawString("Vehicle may not be hybrid/EV", 10, 120);
+  }
+}
+
+void performOilLifeScan() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("OIL LIFE MONITORING", 10, 20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Reading oil life data...", 10, 50);
+  
+  OilLifeData oil = deepScan.getOilLife();
+  
+  tft.fillRect(0, 70, 240, 150, TFT_BLACK);
+  
+  if (oil.condition != "UNKNOWN") {
+    tft.drawString("Oil Life Remaining:", 10, 80);
+    tft.setTextSize(3);
+    
+    uint16_t oilColor = TFT_GREEN;
+    if (oil.condition == "OVERDUE") oilColor = TFT_RED;
+    else if (oil.condition == "CHANGE_SOON") oilColor = TFT_YELLOW;
+    
+    tft.setTextColor(oilColor, TFT_BLACK);
+    tft.drawString(String(oil.remainingPercent, 0) + "%", 50, 100);
+    
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Condition: " + oil.condition, 10, 140);
+    
+    // Oil life progress bar
+    tft.drawRect(10, 160, 200, 20, TFT_WHITE);
+    int oilBarWidth = (oil.remainingPercent / 100.0) * 198;
+    tft.fillRect(11, 161, oilBarWidth, 18, oilColor);
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("Oil life monitoring", 10, 100);
+    tft.drawString("not supported", 10, 120);
+  }
+}
+
+void performAllSensorTest() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+  tft.drawString("ALL SENSOR TEST", 10, 20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Testing all sensors...", 10, 50);
+  
+  std::vector<SensorReading> sensors = deepScan.testAllSensors();
+  
+  tft.fillRect(0, 70, 240, 200, TFT_BLACK);
+  
+  int yPos = 80;
+  int displayCount = 0;
+  
+  for (auto& sensor : sensors) {
+    if (displayCount >= 8) break; // Limit display to fit screen
+    
+    if (sensor.status != "NO_DATA" && sensor.status != "SEND_FAILED") {
+      uint16_t statusColor = TFT_GREEN;
+      if (sensor.status == "HIGH" || sensor.status == "LOW") statusColor = TFT_YELLOW;
+      else if (sensor.status == "FAULT") statusColor = TFT_RED;
+      
+      // Truncate long sensor names for display
+      String shortName = sensor.name.substring(0, 12);
+      if (sensor.name.length() > 12) shortName += "...";
+      
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(shortName, 10, yPos);
+      tft.drawString(String(sensor.value, 1), 130, yPos);
+      tft.setTextColor(statusColor, TFT_BLACK);
+      tft.drawString(sensor.status, 180, yPos);
+      
+      yPos += 15;
+      displayCount++;
+    }
+  }
+  
+  if (displayCount == 0) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("No sensor data available", 10, 100);
+  }
+}
+
+void displayRealTimeData() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("REAL-TIME DATA STREAM", 10, 20);
+  
+  // Start real-time streaming
+  deepScan.startRealTimeStream(1000); // 1 second intervals
+  
+  // Display key real-time parameters
+  while (true) { // In real code, you'd have exit condition
+    // Get current engine data
+    SensorReading rpm = deepScan.testSpecificSensor(0x0C, "RPM");
+    SensorReading speed = deepScan.testSpecificSensor(0x0D, "Speed");
+    SensorReading coolant = deepScan.testSpecificSensor(0x05, "Coolant");
+    SensorReading throttle = deepScan.testSpecificSensor(0x11, "Throttle");
+    
+    // Clear data area
+    tft.fillRect(0, 50, 240, 200, TFT_BLACK);
+    
+    // Display large, easy-to-read values
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    
+    if (rpm.status != "NO_DATA") {
+      tft.drawString("RPM: " + String((int)rpm.value), 10, 60);
+    }
+    
+    if (speed.status != "NO_DATA") {
+      tft.drawString("Speed: " + String((int)speed.value) + " km/h", 10, 90);
+    }
+    
+    if (coolant.status != "NO_DATA") {
+      uint16_t tempColor = (coolant.value > 100) ? TFT_RED : TFT_GREEN;
+      tft.setTextColor(tempColor, TFT_BLACK);
+      tft.drawString("Temp: " + String((int)coolant.value) + "C", 10, 120);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+    
+    if (throttle.status != "NO_DATA") {
+      tft.drawString("Throttle: " + String((int)throttle.value) + "%", 10, 150);
+    }
+    
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Press button to exit", 10, 200);
+    
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Update every second
+    
+    // Check for button press to exit (implement based on your button handling)
+    // if (digitalRead(SCAN_BUTTON) == LOW) break;
+  }
+  
+  deepScan.stopRealTimeStream();
+}
+
+void performTPMSScan() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+  tft.drawString("TIRE PRESSURE SCAN", 10, 20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Reading TPMS data...", 10, 50);
+  
+  std::vector<float> pressures = deepScan.getTirePressures();
+  
+  tft.fillRect(0, 70, 240, 150, TFT_BLACK);
+  
+  if (pressures.size() == 4) {
+    String positions[] = {"Front Left:", "Front Right:", "Rear Left:", "Rear Right:"};
+    
+    for (int i = 0; i < 4; i++) {
+      uint16_t pressureColor = TFT_GREEN;
+      if (pressures[i] < 28 || pressures[i] > 35) pressureColor = TFT_YELLOW;
+      if (pressures[i] < 20 || pressures[i] > 40) pressureColor = TFT_RED;
+      
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(positions[i], 10, 80 + (i * 20));
+      tft.setTextColor(pressureColor, TFT_BLACK);
+      tft.drawString(String(pressures[i], 1) + " PSI", 120, 80 + (i * 20));
+    }
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("TPMS data not available", 10, 100);
+    tft.drawString("Not supported by vehicle", 10, 120);
+  }
+}
+
+// ========== MAIN INTEGRATION EXAMPLE ==========
+
+void handleDeepScanState(ExtendedKioskState currentState) {
+  switch (currentState) {
+    case DEEP_SCAN_MENU:
+      displayDeepScanMenu();
+      // Handle button input to select option
+      break;
+      
+    case BATTERY_HEALTH_SCAN:
+      performBatteryHealthScan();
+      // Auto-return to menu after 10 seconds or button press
+      break;
+      
+    case OIL_LIFE_SCAN:
+      performOilLifeScan();
+      break;
+      
+    case SENSOR_TEST_SCAN:
+      performAllSensorTest();
+      break;
+      
+    case REAL_TIME_DATA_STREAM:
+      displayRealTimeData();
+      break;
+      
+    default:
+      // Handle your existing states
+      break;
+  }
+}
+
+// ========== EXAMPLE USAGE IN YOUR MAIN LOOP ==========
+
+/*
+void loop() {
+  // Your existing kiosk logic...
+  
+  // Add deep scan capability when in scanning state
+  if (currentState == SCANNING) {
+    // Do your normal scan first
+    performStandardScan();
+    
+    // Then offer deep scan option
+    tft.drawString("Press HOLD for Deep Scan", 10, 280);
+    
+    unsigned long buttonStart = 0;
+    while (digitalRead(SCAN_BUTTON) == LOW) {
+      if (buttonStart == 0) buttonStart = millis();
+      if (millis() - buttonStart > 2000) { // 2 second hold
+        currentState = DEEP_SCAN_MENU;
+        initializeDeepScan(); // Initialize once
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+  
+  // Handle deep scan states
+  if (currentState >= DEEP_SCAN_MENU) {
+    handleDeepScanState(currentState);
+  }
+}
+*/
+
+#endif // COMPILE_DEEP_SCAN_EXAMPLES

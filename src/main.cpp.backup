@@ -23,45 +23,18 @@
 #include <ArduinoJson.h>
 #include <ELMduino.h>
 
+//------------------------------------- DEEP SCAN -------------------------------------------------------//
+// ENABLE DEEP SCAN: Set to 0 in platformio.ini to disable: -DENABLE_DEEP_SCAN=0
+#ifdef ENABLE_DEEP_SCAN
+#include "experimental_deep_scan.h"
+ExperimentalDeepScan deepScan; // Global instance
+#endif
+//------------------------------------- DEEP SCAN -------------------------------------------------------//
+
 // ========== NEW BOARD PINOUTS ==========
-#define CAN_TX_PIN    GPIO_NUM_4    // CAN TX (wired to pin 4)
-#define CAN_RX_PIN    GPIO_NUM_5    // CAN RX (wired to pin 5)
-#define CAN_RS_PIN    6             // SN65HVD230 RS pin (transceiver enable/standby control)
-#define SCAN_BUTTON   2             // SW_TRIG pin
-
-// Complete pin definitions for proper GPIO configuration
-const byte VBAT_MEAS   =  1; // Battery Meter
-const byte SW_SEL      =  2; // SCAN_BUTTON
-const byte SW_A        =  3; // D-Pad Up?
-const byte SW_B        =  5; // CAN_RX_PIN
-const byte SW_C        =  4; // CAN_TX_PIN
-const byte SW_D        =  6; // D-Pad
-const byte UNLOCK      =  7; // Unlock
-const byte I2S_BCLK    =  8; // Sound I2S Bit Clock
-const byte I2S_LRC     =  9; // Sound I2S Left/Right Clock
-// TFT pins defined in platformio.ini: TFT_CS=10, TFT_DC=13, TFT_RST=14, TFT_BL=15
-const byte SPI_MOSI_PIN = 11; // SPI
-const byte SPI_SCK_PIN  = 12; // SPI
-const byte TINY_RX     = 16; // ATtiny RX (IR Wake)
-const byte TINY_TX     = 17; // ATtiny TX (IR Wake)
-const byte I2S_DOUT    = 18; // Sound I2S Data Out (Speaker)
-const byte USB_N       = 19; // USB
-const byte USB_P       = 20; // USB
-const byte RGB_OUT     = 21; // Neopixel RGB LED
-const byte IR_OUT      = 38; // IR LED
-const byte RUMBLE      = 39; // Rumble
-const byte IR_IN       = 40; // IR Sensor
-const byte SW_TRIG     = 41; // Trigger Button
-const byte SW_DOCK     = 42; // Dock Sensor
-const byte IR_LATCH    = 45; // IR Brightness Shift Register
-const byte I2C_SDA     = 47; // I2C
-const byte I2C_SCL     = 48; // I2C
-
-// Unused pins that need to be configured
-const byte UNUSED_35   = 35;
-const byte UNUSED_36   = 36;
-const byte UNUSED_37   = 37;
-const byte UNUSED_46   = 46;
+#define CAN_TX_PIN    GPIO_NUM_5    // CAN TX (safe for ESP32-S3)
+#define CAN_RX_PIN    GPIO_NUM_4    // CAN RX (safe for ESP32-S3)
+#define SCAN_BUTTON   2           // SW_TRIG pin
 
 // ========== DISPLAY CONFIGURATION ==========
 // 2.2" LCD: 240x320 pixels - adapted from original 320x480
@@ -96,22 +69,25 @@ unsigned long lastPaymentCheck = 0;
 int vehicleDetectionAttempt    = 0;
 
 // TEST MODE - Set to true to bypass QR/payment and go straight to scanning
-bool TEST_MODE = true;  // Set to false for production kiosk mode
+bool TEST_MODE = false;  // Set to false for production kiosk mode
+
+// DEEP SCAN MODE - Set to true to enable experimental deep scanning features
+bool DEEP_SCAN_MODE = false;  // Set to true to enable advanced diagnostics
 
 // Display state tracking (to prevent redundant redraws)
 bool screenDrawFlags[10] = {false}; // One for each state
 bool forceRedraw = false; // Global flag to force all displays to redraw
 
 // Session configuration
-const unsigned long SESSION_TIMEOUT_MS    = 5 * 60 * 1000; // 5 minutes
+const unsigned long SESSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const unsigned long PAYMENT_POLL_INTERVAL = 3000; // 3 seconds
 
 // Diagnostic scan timeouts - Extended for comprehensive scanning
-const unsigned long TOTAL_SCAN_TIMEOUT_MS     = 90 * 1000; // 90 seconds max scan time
-const unsigned long BAUD_DETECT_TIMEOUT_MS    = 3000;     // 3 seconds per baud rate
+const unsigned long TOTAL_SCAN_TIMEOUT_MS = 90 * 1000; // 90 seconds max scan time
+const unsigned long BAUD_DETECT_TIMEOUT_MS = 3000;     // 3 seconds per baud rate
 const unsigned long TRAFFIC_LISTEN_TIMEOUT_MS = 8000;  // 8 seconds listening
-const unsigned long ECU_PROBE_TIMEOUT_MS      = 20000;      // 20 seconds probing ECUs
-const unsigned long DTC_SCAN_TIMEOUT_MS       = 30000;       // 30 seconds for DTC scanning
+const unsigned long ECU_PROBE_TIMEOUT_MS = 20000;      // 20 seconds probing ECUs
+const unsigned long DTC_SCAN_TIMEOUT_MS = 30000;       // 30 seconds for DTC scanning
 
 // WiFi and API configuration
 const char* WIFI_SSID     = "Pasha";
@@ -131,7 +107,7 @@ struct FaultCode {
 };
 
 std::vector<FaultCode> detectedCodes;
-std::vector<uint16_t>  activeECUs;
+std::vector<uint16_t> activeECUs;
 bool vehicleDetected = false; // Track if vehicle was detected during scan
 int scanRetryCount = 0; // Track scan retry attempts
 twai_message_t message;
@@ -149,8 +125,6 @@ const int NUM_ECUS = sizeof(OBD2_ADDRESSES) / sizeof(OBD2_ADDRESSES[0]);
 void initializeDisplay();
 void initializeWiFi();
 void initializeCAN();
-void enableCANTransceiver();
-void disableCANTransceiver();
 
 // Kiosk Management
 void updateKioskState();
@@ -183,7 +157,6 @@ bool testProtocol(OBD2ProtocolInfo* protocolInfo);
 bool sendOBD2Handshake(uint32_t address, bool extended);
 void scanWithBroadcastAddress(uint32_t broadcastId, bool extended);
 void scanHondaSpecificDTCs(bool extended);
-bool isHondaVehicle();
 
 // Display Functions (adapted for 240x320)
 void displayReadyScreen();
@@ -200,6 +173,9 @@ void drawQRCode(String data, int x, int y, int scale);
 
 // Real CAN Bus Scanning
 void performDiagnosticScan();
+#ifdef ENABLE_DEEP_SCAN
+void performDeepScanDiagnostics(); // NEW: Advanced experimental deep scan
+#endif
 uint32_t autoDetectCANBaudRate();
 void listenForCANTraffic(uint32_t duration_ms);
 void probeOBD2ECUs();
@@ -228,11 +204,6 @@ void setup() {
   Serial.println("Pins: CAN_TX=38, CAN_RX=40, BTN=41");
   Serial.println("====================================");
   
-  // Initialize SN65HVD230 transceiver control (Honda-safe boot)
-  pinMode(CAN_RS_PIN, OUTPUT);
-  digitalWrite(CAN_RS_PIN, HIGH);  // Start in standby mode (Honda-safe)
-  Serial.println("🛡️ SN65HVD230 initialized in standby mode (Honda-safe)");
-  
   // Initialize all systems
   initializeDisplay();
   initializeWiFi();
@@ -240,31 +211,6 @@ void setup() {
   
   // Setup button (keeping for potential manual override)
   pinMode(SCAN_BUTTON, INPUT_PULLUP);
-  
-  // Configure all unused pins to prevent floating and spurious LED activation
-  Serial.println("🔧 Configuring unused pins to prevent floating...");
-  pinMode(UNUSED_35, INPUT_PULLDOWN);  // UNUSED pin 35
-  pinMode(UNUSED_36, INPUT_PULLDOWN);  // UNUSED pin 36  
-  pinMode(UNUSED_37, INPUT_PULLDOWN);  // UNUSED pin 37
-  pinMode(UNUSED_46, INPUT_PULLDOWN);  // UNUSED pin 46
-  
-  // Configure used pins that need specific states
-  pinMode(RGB_OUT, OUTPUT);     // Pin 21 - RGB LED control
-  pinMode(IR_OUT, OUTPUT);      // Pin 38 - IR LED  
-  pinMode(RUMBLE, OUTPUT);      // Pin 39 - Rumble motor
-  digitalWrite(RGB_OUT, LOW);   // Turn off RGB LED initially
-  digitalWrite(IR_OUT, LOW);    // Turn off IR LED initially  
-  digitalWrite(RUMBLE, LOW);    // Turn off rumble initially
-  
-  // Configure other input pins properly
-  pinMode(SW_A, INPUT_PULLUP);        // Pin 3 - D-Pad
-  pinMode(SW_D, INPUT_PULLUP);        // Pin 6 - D-Pad
-  pinMode(SW_TRIG, INPUT_PULLUP);     // Pin 41 - Trigger button
-  pinMode(SW_DOCK, INPUT_PULLUP);     // Pin 42 - Dock sensor
-  pinMode(IR_IN, INPUT);              // Pin 40 - IR sensor (no pullup needed)
-  pinMode(VBAT_MEAS, INPUT);          // Pin 1 - Battery measurement
-  
-  Serial.println("✅ All pins configured - no floating pins");
   
   // Check if TEST MODE is enabled
   if (TEST_MODE) {
@@ -274,7 +220,18 @@ void setup() {
     currentState = READY_TO_SCAN;
     sessionStartTime = millis();
     Serial.println("✓ TEST mode initialized, ready to scan immediately");
+  }
+  
+  // Show deep scan status
+  if (DEEP_SCAN_MODE) {
+    Serial.println("🔬 DEEP SCAN MODE ENABLED - Advanced diagnostics active");
+    Serial.println("   Enhanced features: Battery health, oil life, sensor testing");
   } else {
+    Serial.println("🔍 STANDARD SCAN MODE - Normal OBD2 diagnostics");
+    Serial.println("   Set DEEP_SCAN_MODE = true for experimental features");
+  }
+  
+  if (!TEST_MODE) {
     // Normal kiosk mode - Create session immediately on boot with retry logic
     Serial.println("🚀 Boot-to-scan mode: Creating session automatically...");
     
@@ -306,6 +263,14 @@ void setup() {
   
   stateStartTime = millis();
   Serial.println("✓ Kiosk initialized in boot-to-scan mode");
+  #ifdef ENABLE_DEEP_SCAN
+    if (deepScan.initialize()) {
+      Serial.println("🔬 Deep scan ready");
+      if (deepScan.detectManufacturer()) {
+        Serial.println("🏭 Manufacturer: " + deepScan.getManufacturerName());
+      }
+    }
+  #endif
 }
 
 // ========== MAIN LOOP ==========
@@ -358,8 +323,8 @@ void initializeWiFi() {
 
 void initializeCAN() {
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-  twai_timing_config_t t_config  = TWAI_TIMING_CONFIG_500KBITS();
-  twai_filter_config_t f_config  = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
   
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
     Serial.println("✓ CAN driver installed");
@@ -370,25 +335,9 @@ void initializeCAN() {
   
   if (twai_start() == ESP_OK) {
     Serial.println("✓ CAN driver started");
-    // Enable transceiver for vehicle detection
-    enableCANTransceiver();
   } else {
     Serial.println("❌ Failed to start CAN driver");
   }
-}
-
-void enableCANTransceiver() {
-  // Set RS pin LOW to enable SN65HVD230 (normal mode)
-  digitalWrite(CAN_RS_PIN, LOW);
-  delay(10);  // Allow transceiver to switch modes
-  Serial.println("🟢 SN65HVD230 enabled (normal mode)");
-}
-
-void disableCANTransceiver() {
-  // Set RS pin HIGH to disable SN65HVD230 (standby mode)
-  digitalWrite(CAN_RS_PIN, HIGH);
-  delay(10);  // Allow transceiver to switch modes
-  Serial.println("🔴 SN65HVD230 disabled (standby mode - Honda-safe)");
 }
 
 // ========== KIOSK STATE MANAGEMENT ==========
@@ -469,9 +418,18 @@ void updateKioskState() {
       
     case SCANNING:
       displayScanning();
-      // Ensure transceiver is enabled for scanning (especially important for retries)
-      enableCANTransceiver();
-      performDiagnosticScan();
+      
+      // Choose scanning method based on DEEP_SCAN_MODE
+      if (DEEP_SCAN_MODE) {
+      #ifdef ENABLE_DEEP_SCAN
+        performDeepScanDiagnostics();  // Advanced experimental diagnostics
+      #else
+        Serial.println("⚠️ DEEP_SCAN_MODE enabled but not compiled - using standard scan");
+        performDiagnosticScan();       // Fallback to standard OBD2 diagnostics
+      #endif
+      } else {
+        performDiagnosticScan();       // Standard OBD2 diagnostics
+      }
       
       // Submit diagnostic results to database for AI analysis and email
       Serial.println("📤 Submitting diagnostic results to server...");
@@ -1016,14 +974,27 @@ void displayScanning(bool fullRedraw) {
   tft.println("VEHICLE");
   
   tft.setTextSize(1);
-  tft.setCursor(20, 180);
-  tft.println("Please wait while we");
-  tft.setCursor(20, 195);
-  tft.println("scan all vehicle");
-  tft.setCursor(20, 210);
-  tft.println("systems...");
+  tft.setCursor(20, 160);
   
-  Serial.println("📺 Scanning displayed");
+  if (DEEP_SCAN_MODE) {
+    tft.println("🔬 DEEP SCAN MODE");
+    tft.setCursor(20, 175);
+    tft.println("Advanced diagnostics:");
+    tft.setCursor(20, 190);
+    tft.println("• Battery health");
+    tft.setCursor(20, 205);
+    tft.println("• Oil life monitoring");
+    tft.setCursor(20, 220);
+    tft.println("• Sensor analysis");
+  } else {
+    tft.println("Please wait while we");
+    tft.setCursor(20, 175);
+    tft.println("scan all vehicle");
+    tft.setCursor(20, 190);
+    tft.println("systems...");
+  }
+  
+  Serial.println("📺 Scanning displayed (Deep scan: " + String(DEEP_SCAN_MODE ? "ON" : "OFF") + ")");
 }
 
 void displayScanResults() {
@@ -1036,11 +1007,15 @@ void displayScanResults() {
     tft.fillScreen(TFT_WHITE);
     
     // Header
-    tft.fillRect(0, 0, SCREEN_WIDTH, 40, TFT_NAVY);
+    tft.fillRect(0, 0, SCREEN_WIDTH, 40, DEEP_SCAN_MODE ? TFT_PURPLE : TFT_NAVY);
     tft.setTextSize(1);
     tft.setTextColor(TFT_WHITE);
-    tft.setCursor(60, 15);
-    tft.println("SCAN COMPLETE");
+    tft.setCursor(DEEP_SCAN_MODE ? 40 : 60, 15);
+    if (DEEP_SCAN_MODE) {
+      tft.println("🔬 DEEP SCAN DONE");
+    } else {
+      tft.println("SCAN COMPLETE");
+    }
     
     // Results summary
     int y = 60;
@@ -1269,12 +1244,11 @@ void performDiagnosticScan() {
   // Update display with progress
   updateScanProgress("Detecting protocol...", 0);
   
-  // Step 1: Professional Protocol Detection (transceiver already enabled)
+  // Step 1: Professional Protocol Detection
   obd2_protocol_t detectedProtocol = detectOBD2Protocol();
   if (detectedProtocol == OBD2_PROTOCOL_NONE) {
     Serial.println("❌ No OBD2 protocol detected");
     updateScanProgress("No vehicle detected", 100);
-    disableCANTransceiver();  // Return to standby mode
     delay(3000); // Show message for 3 seconds
     return;
   }
@@ -1283,7 +1257,6 @@ void performDiagnosticScan() {
   if (millis() - scanStartTime > TOTAL_SCAN_TIMEOUT_MS) {
     Serial.println("⏰ Scan timeout reached");
     updateScanProgress("Scan timeout", 100);
-    disableCANTransceiver();  // Return to standby mode
     delay(2000);
     return;
   }
@@ -1320,65 +1293,22 @@ void performDiagnosticScan() {
     return;
   }
   
-  // Step 2: Professional scanner approach - physical addressing for Honda
-  Serial.println("🏆 PROFESSIONAL SCANNER APPROACH");
-  Serial.println("   Using physical addressing and proper pacing like real scanners");
+  // Step 2: Professional Broadcast Scanning
+  Serial.println("📡 BROADCAST SCANNING - Querying all ECUs...");
+  updateScanProgress("Broadcasting queries...", 50);
+  scanWithBroadcastAddress(detectedProtocolInfo.broadcastId, detectedProtocolInfo.extendedId);
+  updateScanProgress("Collecting responses...", 75);
   
-  // Honda requires physical addressing (0x7E0) instead of functional (0x7DF)
-  uint32_t targetAddress = 0x7E0;  // Physical ECM address
-  uint32_t expectedResponse = 0x7E8;  // ECM response address
-  
-  updateScanProgress("Professional DTC query...", 50);
-  
-  twai_message_t msg;
-  msg.identifier = targetAddress;
-  msg.extd = 0;
-  msg.rtr = 0;
-  msg.data_length_code = 8;
-  msg.data[0] = 0x01;  // Length
-  msg.data[1] = 0x03;  // Mode 03 - Stored DTCs
-  msg.data[2] = 0x00;
-  msg.data[3] = 0x00;
-  msg.data[4] = 0x00;
-  msg.data[5] = 0x00;
-  msg.data[6] = 0x00;
-  msg.data[7] = 0x00;
-  
-  Serial.printf("📡 Professional query to ECM 0x%03X (like real scanners)...\n", targetAddress);
-  
-  // Respect Honda timing - max 3 queries per second
-  delay(350);  // 350ms spacing = ~3 queries/sec max
-  
-  if (twai_transmit(&msg, pdMS_TO_TICKS(200)) == ESP_OK) {
-    unsigned long start = millis();
-    bool foundResponse = false;
-    
-    while (millis() - start < 2000 && !foundResponse) {  // 2 second timeout
-      twai_message_t response;
-      if (twai_receive(&response, pdMS_TO_TICKS(100)) == ESP_OK) {
-        // Only process expected ECM response
-        if (response.identifier == expectedResponse && 
-            response.data_length_code >= 3 && response.data[1] == 0x43) {
-          Serial.printf("✅ Professional ECM response from 0x%03X\n", response.identifier);
-          parseAndStoreDTC(response.data, response.data_length_code, response.identifier);
-          foundResponse = true;
-        }
-      }
-    }
-    
-    if (!foundResponse) {
-      Serial.println("ℹ️ No DTCs found - vehicle appears healthy");
-    }
+  // ✅ ULTRA-CONSERVATIVE: Skip all additional scanning due to CAN bus issues
+  if (detectedCodes.size() == 0) {
+    Serial.println("ℹ️ No DTCs from broadcast scan - vehicle may be healthy");
+    Serial.println("✅ SKIPPING Honda-specific and comprehensive scans");
+    Serial.println("   (Prevents false DTCs and CAN communication issues)");
+  } else {
+    Serial.printf("✅ Found %d DTC(s) from broadcast scan\n", detectedCodes.size());
   }
   
-  updateScanProgress("Complete!", 75);
-  delay(1000);  // Professional scanner spacing
-  
   updateScanProgress("Scan complete!", 100);
-  
-  // Return SN65HVD230 to standby mode (Honda-safe)
-  Serial.println("🛡️ Returning SN65HVD230 to standby mode (Honda-safe)");
-  disableCANTransceiver();
   
   unsigned long scanDuration = millis() - scanStartTime;
   Serial.printf("✓ Scan complete: %d active ECUs, %d fault codes (%.1fs)\n", 
@@ -1436,11 +1366,52 @@ void scanForDTCs(uint16_t ecuId) {
 }
 
 void parseAndStoreDTC(uint8_t* data, int len, uint16_t ecuId) {
+  // ✅ CRITICAL: Validate this is actually a DTC response before parsing
+  if (len < 4) {
+    Serial.println("   ⚠️ Response too short for DTC data");
+    return;
+  }
+  
+  // Check for valid DTC response header (Mode 43 = stored DTCs, Mode 47 = pending DTCs)
+  if (data[0] < 0x02 || (data[1] != 0x43 && data[1] != 0x47)) {
+    Serial.printf("   ⚠️ Invalid DTC response header: %02X %02X (expected 43 or 47) from ECU 0x%03X\n", data[0], data[1], ecuId);
+    Serial.print("   Raw data: ");
+    for (int i = 0; i < len; i++) {
+      Serial.printf("%02X ", data[i]);
+    }
+    Serial.println();
+    return;
+  }
+  
+  Serial.printf("   ✅ Valid DTC response from ECU 0x%03X: Mode %02X\n", ecuId, data[1]);
+  
   for (int i = 2; i < len - 1; i += 2) {
     uint8_t byte1 = data[i];
     uint8_t byte2 = data[i + 1];
     
-    if (byte1 == 0 && byte2 == 0) continue;
+    // ✅ ENHANCED: Skip invalid DTC patterns that indicate noise/garbage
+    if (byte1 == 0 && byte2 == 0) continue; // No DTC
+    if (byte1 == 0xFF && byte2 == 0xFF) continue; // Invalid data pattern
+    if (byte1 == byte2 && byte2 > 0xF0) continue; // Repeated high bytes = noise
+    
+    // ✅ VALIDATION: Check for reasonable DTC ranges
+    uint16_t rawDTC = (byte1 << 8) | byte2;
+    if (rawDTC < 0x0100 || rawDTC > 0x3FFF) {
+      Serial.printf("   ⚠️ Suspicious DTC bytes: %02X%02X (out of normal range)\n", byte1, byte2);
+      continue; // Skip suspicious data
+    }
+    
+    // ✅ BLACKLIST: Filter known fake DTC patterns from Honda CAN noise
+    if (rawDTC == 0x01C0 || rawDTC == 0x01C1 || rawDTC == 0x2955) {
+      Serial.printf("   🚫 BLOCKED known fake DTC: %02X%02X (Honda CAN noise pattern)\n", byte1, byte2);
+      continue; // Skip these specific fake codes
+    }
+    
+    // ✅ PATTERN DETECTION: Block suspicious sequential patterns
+    if ((rawDTC >= 0x01C0 && rawDTC <= 0x01CF) || (rawDTC >= 0x2950 && rawDTC <= 0x295F)) {
+      Serial.printf("   🚫 BLOCKED suspicious DTC pattern: %02X%02X (likely noise)\n", byte1, byte2);
+      continue; // Skip likely noise patterns
+    }
     
     // Determine DTC type
     char category = 'P';
@@ -1754,13 +1725,14 @@ void scanHondaSpecificDTCs(bool extended) {
   Serial.println("🔧 HONDA-SPECIFIC DTC SCANNING");
   Serial.println("   Using conservative timing and targeted ECU queries...");
   
-  // Initial delay to let CAN bus settle
-  delay(1000);
-  
-  // Minimal ECU addresses to prevent CAN bus disruption
+  // Honda-specific ECU addresses (most common in 2018+ Honda vehicles)
   uint16_t hondaECUs[] = {
-    0x7E0   // Engine ECU (PCM) only - most likely to have DTCs
-    // ❌ REMOVED other ECUs to prevent U0100/U0029/U0155 communication errors
+    0x7E0,  // Engine ECU (PCM) - most likely to have DTCs
+    0x7E1,  // Transmission ECU  
+    0x7E8,  // Engine responses
+    0x7E9,  // Common response address
+    0x7EA,  // Body control module
+    0x7EB   // Another common response
   };
   
   int numHondaECUs = sizeof(hondaECUs) / sizeof(hondaECUs[0]);
@@ -1836,74 +1808,10 @@ void scanHondaSpecificDTCs(bool extended) {
     }
     
     // Honda-specific: Longer delay between ECU queries to prevent interference
-    delay(2000);  // 2000ms between ECU queries to prevent CAN bus disruption
+    delay(750);  // 750ms between Honda ECU queries
   }
   
   Serial.printf("🔧 HONDA SCAN COMPLETE: Found %d DTCs\n", detectedCodes.size());
-  
-  // Final delay to let CAN bus settle before returning to normal vehicle operation
-  delay(2000);
-}
-
-bool isHondaVehicle() {
-  // Quick Honda detection using VIN query (Mode 09, PID 02)
-  twai_message_t msg;
-  msg.identifier = 0x7DF;  // Broadcast address
-  msg.extd = 0;
-  msg.rtr = 0;
-  msg.data_length_code = 8;
-  msg.data[0] = 0x02;  // Length
-  msg.data[1] = 0x09;  // Mode 09 - Vehicle Info
-  msg.data[2] = 0x02;  // PID 02 - VIN
-  msg.data[3] = 0x00;
-  msg.data[4] = 0x00;
-  msg.data[5] = 0x00;
-  msg.data[6] = 0x00;
-  msg.data[7] = 0x00;
-  
-  if (twai_transmit(&msg, pdMS_TO_TICKS(200)) == ESP_OK) {
-    unsigned long start = millis();
-    while (millis() - start < 2000) {  // 2 second timeout
-      twai_message_t response;
-      if (twai_receive(&response, pdMS_TO_TICKS(100)) == ESP_OK) {
-        // Look for VIN response
-        if (response.data_length_code >= 7 && response.data[0] >= 0x06 && 
-            response.data[1] == 0x49 && response.data[2] == 0x02) {
-          // Check VIN characters for Honda indicators
-          for (int i = 3; i < response.data_length_code && i < 8; i++) {
-            char vinChar = (char)response.data[i];
-            // Honda VINs typically start with 1H, 2H, 3H, JH, 19X, etc.
-            if ((i == 3 && (vinChar == '1' || vinChar == '2' || vinChar == '3' || vinChar == 'J')) ||
-                (i == 4 && vinChar == 'H')) {
-              Serial.println("🏎️ Honda vehicle detected from VIN");
-              return true;
-            }
-          }
-        }
-      }
-    }
-  }
-  
-  // Fallback: Check if responding to Honda ECU addresses
-  msg.identifier = 0x7E0;  // Honda PCM address
-  msg.data[1] = 0x01;  // Mode 01
-  msg.data[2] = 0x00;  // Supported PIDs
-  
-  if (twai_transmit(&msg, pdMS_TO_TICKS(200)) == ESP_OK) {
-    unsigned long start = millis();
-    while (millis() - start < 1000) {
-      twai_message_t response;
-      if (twai_receive(&response, pdMS_TO_TICKS(100)) == ESP_OK) {
-        if ((response.identifier == 0x7E8 || response.identifier == 0x7E9) &&
-            response.data_length_code >= 3 && response.data[1] == 0x41) {
-          Serial.println("🏎️ Honda vehicle detected from ECU response");
-          return true;
-        }
-      }
-    }
-  }
-  
-  return false;  // Not detected as Honda
 }
 
 // ========== REAL CAN BUS FUNCTIONS ==========
@@ -2301,6 +2209,183 @@ void scanAllDTCs() {
 void resetDisplayFlags() {
   // Force all display functions to redraw by setting the global flag
   forceRedraw = true;
+}
+
+// ========== DEEP SCAN DIAGNOSTICS ==========
+void performDeepScanDiagnostics() {
+  Serial.println("🔬 EXPERIMENTAL DEEP SCAN DIAGNOSTICS");
+  Serial.println("   Enhanced professional-grade analysis with experimental features");
+  unsigned long scanStartTime = millis();
+  
+  detectedCodes.clear();
+  activeECUs.clear();
+  vehicleDetected = false;
+  
+  #ifdef ENABLE_DEEP_SCAN
+  updateScanProgress("Initializing deep scan...", 5);
+  
+  // Step 1: Standard protocol detection first
+  updateScanProgress("Detecting vehicle...", 10);
+  obd2_protocol_t detectedProtocol = detectOBD2Protocol();
+  if (detectedProtocol == OBD2_PROTOCOL_NONE) {
+    Serial.println("❌ No vehicle detected for deep scan");
+    updateScanProgress("No vehicle detected", 100);
+    delay(3000);
+    return;
+  }
+  
+  vehicleDetected = true;
+  Serial.println("✅ Vehicle detected - starting deep analysis...");
+  updateScanProgress("Vehicle found! Deep scanning...", 20);
+  
+  // Step 2: Manufacturer Detection for proprietary PIDs
+  Serial.println("🏭 Detecting vehicle manufacturer...");
+  updateScanProgress("Detecting manufacturer...", 30);
+  if (deepScan.detectManufacturer()) {
+    Serial.println("✅ Manufacturer detected: " + deepScan.getManufacturerName());
+    updateScanProgress("Found: " + deepScan.getManufacturerName(), 35);
+    delay(1000); // Show manufacturer briefly
+  }
+  
+  // Step 3: Standard OBD2 scanning (reuse existing logic)
+  updateScanProgress("Standard OBD2 scan...", 40);
+  
+  // Get protocol details for broadcast scanning
+  OBD2ProtocolInfo detectedProtocolInfo;
+  switch (detectedProtocol) {
+    case OBD2_PROTOCOL_CAN_11BIT_500K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_11BIT_500K, 500000, false, 0x7DF, "CAN 11-bit 500kbps"};
+      break;
+    case OBD2_PROTOCOL_CAN_11BIT_250K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_11BIT_250K, 250000, false, 0x7DF, "CAN 11-bit 250kbps"};
+      break;
+    case OBD2_PROTOCOL_CAN_29BIT_500K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_29BIT_500K, 500000, true, 0x18DB33F1, "CAN 29-bit 500kbps"};
+      break;
+    case OBD2_PROTOCOL_CAN_29BIT_250K:
+      detectedProtocolInfo = {OBD2_PROTOCOL_CAN_29BIT_250K, 250000, true, 0x18DB33F1, "CAN 29-bit 250kbps"};
+      break;
+    default:
+      Serial.println("❌ Unsupported protocol for deep scan");
+      return;
+  }
+  
+  // Perform standard broadcast scan
+  scanWithBroadcastAddress(detectedProtocolInfo.broadcastId, detectedProtocolInfo.extendedId);
+  updateScanProgress("Standard scan complete", 50);
+  
+  // Step 4: EXPERIMENTAL DEEP SCAN FEATURES
+  Serial.println("🔬 STARTING EXPERIMENTAL FEATURES...");
+  
+  // Battery Health Analysis
+  updateScanProgress("Battery health check...", 60);
+  BatteryHealth battery = deepScan.getBatteryHealth();
+  if (battery.health != "UNKNOWN") {
+    Serial.println("🔋 Battery Health: " + battery.health + " (" + String(battery.stateOfCharge) + "% SOC)");
+    updateScanProgress("Battery: " + battery.health, 65);
+    delay(1000);
+  }
+  
+  // Oil Life Analysis  
+  updateScanProgress("Oil life analysis...", 70);
+  OilLifeData oil = deepScan.getOilLife();
+  if (oil.condition != "UNKNOWN") {
+    Serial.println("🛢️ Oil Life: " + String(oil.remainingPercent) + "% (" + oil.condition + ")");
+    updateScanProgress("Oil: " + oil.condition, 75);
+    delay(1000);
+  }
+  
+  // Individual Sensor Testing
+  updateScanProgress("Testing all sensors...", 80);
+  std::vector<SensorReading> sensors = deepScan.testAllSensors();
+  int workingSensors = 0;
+  for (auto& sensor : sensors) {
+    if (sensor.status != "NO_DATA" && sensor.status != "SEND_FAILED") {
+      workingSensors++;
+      if (sensor.status == "HIGH" || sensor.status == "LOW" || sensor.status == "FAULT") {
+        // ❌ REMOVED: Don't create fake DTCs for normal sensor variations
+        // Only log sensor readings - these are NOT actual fault codes!
+        Serial.println("📊 Sensor Reading: " + sensor.name + " = " + String(sensor.value) + " [" + sensor.status + "]");
+      }
+    }
+  }
+  Serial.println("✅ Tested " + String(sensors.size()) + " sensors, " + String(workingSensors) + " responding");
+  
+  // TPMS Readings (if supported)
+  updateScanProgress("Tire pressure check...", 85);
+  std::vector<float> tirePressures = deepScan.getTirePressures();
+  if (tirePressures.size() == 4) {
+    Serial.println("🛞 TPMS Data: FL=" + String(tirePressures[0], 1) + 
+                  " FR=" + String(tirePressures[1], 1) + 
+                  " RL=" + String(tirePressures[2], 1) + 
+                  " RR=" + String(tirePressures[3], 1) + " PSI");
+    
+    // Check for low/high tire pressure
+    for (int i = 0; i < 4; i++) {
+      if (tirePressures[i] < 28 || tirePressures[i] > 40) {
+        FaultCode tireFault;
+        tireFault.code = "TIRE_P" + String(i);
+        tireFault.system = "Tire Pressure " + String(i+1) + " - " + String(tirePressures[i], 1) + " PSI";
+        tireFault.isPending = true;
+        tireFault.ecuId = 0x7EA;
+        detectedCodes.push_back(tireFault);
+      }
+    }
+  }
+  
+  // Advanced ECU Deep Scan
+  updateScanProgress("Deep ECU analysis...", 90);
+  bool deepECUScan = deepScan.performDeepECUScan();
+  if (deepECUScan) {
+    Serial.println("🖥️ Advanced ECU communication successful");
+  }
+  
+  updateScanProgress("Deep scan complete!", 100);
+  
+  #else
+  // Deep scan not compiled - fall back to standard scan
+  Serial.println("⚠️ DEEP_SCAN_MODE enabled but ENABLE_DEEP_SCAN not compiled");
+  Serial.println("   Falling back to standard OBD2 scan...");
+  updateScanProgress("Deep scan not available", 50);
+  delay(2000);
+  
+  // Fall back to standard scan
+  obd2_protocol_t detectedProtocol = detectOBD2Protocol();
+  if (detectedProtocol != OBD2_PROTOCOL_NONE) {
+    vehicleDetected = true;
+    updateScanProgress("Standard scan fallback", 75);
+    
+    OBD2ProtocolInfo detectedProtocolInfo;
+    switch (detectedProtocol) {
+      case OBD2_PROTOCOL_CAN_11BIT_500K:
+        detectedProtocolInfo = {OBD2_PROTOCOL_CAN_11BIT_500K, 500000, false, 0x7DF, "CAN 11-bit 500kbps"};
+        break;
+      case OBD2_PROTOCOL_CAN_11BIT_250K:
+        detectedProtocolInfo = {OBD2_PROTOCOL_CAN_11BIT_250K, 250000, false, 0x7DF, "CAN 11-bit 250kbps"};
+        break;
+      default:
+        detectedProtocolInfo = {OBD2_PROTOCOL_CAN_11BIT_500K, 500000, false, 0x7DF, "CAN 11-bit 500kbps"};
+        break;
+    }
+    
+    scanWithBroadcastAddress(detectedProtocolInfo.broadcastId, detectedProtocolInfo.extendedId);
+  }
+  updateScanProgress("Fallback scan complete", 100);
+  #endif
+  
+  unsigned long scanDuration = millis() - scanStartTime;
+  Serial.printf("🔬 DEEP SCAN COMPLETE: %d active ECUs, %d issues found (%.1fs)\n", 
+                activeECUs.size(), detectedCodes.size(), scanDuration / 1000.0);
+  
+  // Print advanced summary
+  if (detectedCodes.size() > 0) {
+    Serial.println("🚨 Issues detected by deep scan:");
+    for (const auto& code : detectedCodes) {
+      Serial.println("   " + code.code + " - " + code.system);
+    }
+  } else {
+    Serial.println("✅ Deep scan found no issues - vehicle is healthy!");
+  }
 }
 
 void resetToReady() {

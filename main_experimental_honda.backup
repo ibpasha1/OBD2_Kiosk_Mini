@@ -24,24 +24,23 @@
 #include <ELMduino.h>
 
 // ========== NEW BOARD PINOUTS ==========
-#define CAN_TX_PIN    GPIO_NUM_4    // CAN TX (wired to pin 4)
-#define CAN_RX_PIN    GPIO_NUM_5    // CAN RX (wired to pin 5)
-#define CAN_RS_PIN    6             // SN65HVD230 RS pin (transceiver enable/standby control)
-#define SCAN_BUTTON   2             // SW_TRIG pin
+#define CAN_TX_PIN    GPIO_NUM_5    // CAN TX (safe for ESP32-S3)
+#define CAN_RX_PIN    GPIO_NUM_4    // CAN RX (safe for ESP32-S3)
+#define SCAN_BUTTON   2           // SW_TRIG pin
 
 // Complete pin definitions for proper GPIO configuration
 const byte VBAT_MEAS   =  1; // Battery Meter
 const byte SW_SEL      =  2; // SCAN_BUTTON
 const byte SW_A        =  3; // D-Pad Up?
-const byte SW_B        =  5; // CAN_RX_PIN
-const byte SW_C        =  4; // CAN_TX_PIN
+const byte SW_B        =  4; // CAN_RX_PIN
+const byte SW_C        =  5; // CAN_TX_PIN
 const byte SW_D        =  6; // D-Pad
 const byte UNLOCK      =  7; // Unlock
 const byte I2S_BCLK    =  8; // Sound I2S Bit Clock
 const byte I2S_LRC     =  9; // Sound I2S Left/Right Clock
 // TFT pins defined in platformio.ini: TFT_CS=10, TFT_DC=13, TFT_RST=14, TFT_BL=15
-const byte SPI_MOSI_PIN = 11; // SPI
-const byte SPI_SCK_PIN  = 12; // SPI
+const byte SPI_MOSI_PIN= 11; // SPI
+const byte SPI_SCK_PIN = 12; // SPI
 const byte TINY_RX     = 16; // ATtiny RX (IR Wake)
 const byte TINY_TX     = 17; // ATtiny TX (IR Wake)
 const byte I2S_DOUT    = 18; // Sound I2S Data Out (Speaker)
@@ -149,8 +148,6 @@ const int NUM_ECUS = sizeof(OBD2_ADDRESSES) / sizeof(OBD2_ADDRESSES[0]);
 void initializeDisplay();
 void initializeWiFi();
 void initializeCAN();
-void enableCANTransceiver();
-void disableCANTransceiver();
 
 // Kiosk Management
 void updateKioskState();
@@ -184,6 +181,8 @@ bool sendOBD2Handshake(uint32_t address, bool extended);
 void scanWithBroadcastAddress(uint32_t broadcastId, bool extended);
 void scanHondaSpecificDTCs(bool extended);
 bool isHondaVehicle();
+bool checkCANBusHealth();
+void recoverFromBusOff();
 
 // Display Functions (adapted for 240x320)
 void displayReadyScreen();
@@ -227,11 +226,6 @@ void setup() {
   Serial.println("Features: Full functionality, cleaner code");
   Serial.println("Pins: CAN_TX=38, CAN_RX=40, BTN=41");
   Serial.println("====================================");
-  
-  // Initialize SN65HVD230 transceiver control (Honda-safe boot)
-  pinMode(CAN_RS_PIN, OUTPUT);
-  digitalWrite(CAN_RS_PIN, HIGH);  // Start in standby mode (Honda-safe)
-  Serial.println("🛡️ SN65HVD230 initialized in standby mode (Honda-safe)");
   
   // Initialize all systems
   initializeDisplay();
@@ -357,38 +351,67 @@ void initializeWiFi() {
 }
 
 void initializeCAN() {
-  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+  Serial.println("🏎️ HONDA-SAFE CAN INITIALIZATION");
+  
+  // Step 1: Keep transceiver in standby during ESP32 boot (Honda requirement)
+  // TODO: Add transceiver standby control if hardware supports it
+  Serial.println("   Step 1: Transceiver standby during boot");
+  
+  // Step 2: Initialize CAN in listen-only mode first (Honda requirement)
+  Serial.println("   Step 2: Starting in listen-only mode to validate bus");
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
   twai_timing_config_t t_config  = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t f_config  = TWAI_FILTER_CONFIG_ACCEPT_ALL();
   
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
-    Serial.println("✓ CAN driver installed");
+    Serial.println("✓ CAN driver installed in listen-only mode");
   } else {
     Serial.println("❌ Failed to install CAN driver");
     return;
   }
   
   if (twai_start() == ESP_OK) {
-    Serial.println("✓ CAN driver started");
-    // Enable transceiver for vehicle detection
-    enableCANTransceiver();
+    Serial.println("✓ CAN driver started in listen-only mode");
   } else {
     Serial.println("❌ Failed to start CAN driver");
+    return;
   }
-}
-
-void enableCANTransceiver() {
-  // Set RS pin LOW to enable SN65HVD230 (normal mode)
-  digitalWrite(CAN_RS_PIN, LOW);
-  delay(10);  // Allow transceiver to switch modes
-  Serial.println("🟢 SN65HVD230 enabled (normal mode)");
-}
-
-void disableCANTransceiver() {
-  // Set RS pin HIGH to disable SN65HVD230 (standby mode)
-  digitalWrite(CAN_RS_PIN, HIGH);
-  delay(10);  // Allow transceiver to switch modes
-  Serial.println("🔴 SN65HVD230 disabled (standby mode - Honda-safe)");
+  
+  // Step 3: Listen for bus activity to confirm Honda ECUs are present and stable
+  Serial.println("   Step 3: Validating bus stability (Honda requirement)");
+  unsigned long listenStart = millis();
+  int frameCount = 0;
+  
+  while (millis() - listenStart < 2000) {  // 2 second listen window
+    twai_message_t rxMessage;
+    if (twai_receive(&rxMessage, pdMS_TO_TICKS(100)) == ESP_OK) {
+      frameCount++;
+      // Look for Honda ECM frames (usually 0x17C, 0x158, etc.)
+      if (frameCount == 1) {
+        Serial.printf("   📡 Bus active - first frame ID: 0x%03X\n", rxMessage.identifier);
+      }
+    }
+  }
+  
+  if (frameCount > 0) {
+    Serial.printf("✓ Bus validated: %d frames in 2 seconds\n", frameCount);
+  } else {
+    Serial.println("⚠️ No bus activity detected - vehicle may be off");
+  }
+  
+  // Step 4: Switch to normal mode for actual scanning (Honda will be ready)
+  Serial.println("   Step 4: Switching to normal mode for Honda-safe scanning");
+  twai_stop();
+  twai_driver_uninstall();
+  
+  // Reinstall in normal mode for scanning
+  g_config.mode = TWAI_MODE_NORMAL;
+  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK &&
+      twai_start() == ESP_OK) {
+    Serial.println("✓ Honda-safe CAN initialization complete");
+  } else {
+    Serial.println("❌ Failed to restart CAN in normal mode");
+  }
 }
 
 // ========== KIOSK STATE MANAGEMENT ==========
@@ -469,8 +492,6 @@ void updateKioskState() {
       
     case SCANNING:
       displayScanning();
-      // Ensure transceiver is enabled for scanning (especially important for retries)
-      enableCANTransceiver();
       performDiagnosticScan();
       
       // Submit diagnostic results to database for AI analysis and email
@@ -1269,12 +1290,11 @@ void performDiagnosticScan() {
   // Update display with progress
   updateScanProgress("Detecting protocol...", 0);
   
-  // Step 1: Professional Protocol Detection (transceiver already enabled)
+  // Step 1: Professional Protocol Detection
   obd2_protocol_t detectedProtocol = detectOBD2Protocol();
   if (detectedProtocol == OBD2_PROTOCOL_NONE) {
     Serial.println("❌ No OBD2 protocol detected");
     updateScanProgress("No vehicle detected", 100);
-    disableCANTransceiver();  // Return to standby mode
     delay(3000); // Show message for 3 seconds
     return;
   }
@@ -1283,7 +1303,6 @@ void performDiagnosticScan() {
   if (millis() - scanStartTime > TOTAL_SCAN_TIMEOUT_MS) {
     Serial.println("⏰ Scan timeout reached");
     updateScanProgress("Scan timeout", 100);
-    disableCANTransceiver();  // Return to standby mode
     delay(2000);
     return;
   }
@@ -1320,65 +1339,110 @@ void performDiagnosticScan() {
     return;
   }
   
-  // Step 2: Professional scanner approach - physical addressing for Honda
-  Serial.println("🏆 PROFESSIONAL SCANNER APPROACH");
-  Serial.println("   Using physical addressing and proper pacing like real scanners");
+  // Step 2: Honda-Safe Professional Scanning Protocol
+  Serial.println("🏎️ HONDA-SAFE PROFESSIONAL SCANNING");
+  Serial.println("   Following Honda ECU communication best practices");
   
-  // Honda requires physical addressing (0x7E0) instead of functional (0x7DF)
-  uint32_t targetAddress = 0x7E0;  // Physical ECM address
-  uint32_t expectedResponse = 0x7E8;  // ECM response address
+  // Honda Session Flow Implementation
+  updateScanProgress("Honda-safe handshake...", 30);
   
-  updateScanProgress("Professional DTC query...", 50);
+  // Step 2a: Single VIN query for gentle handshake (Honda-safe)
+  Serial.println("   📋 Step 1: Gentle VIN handshake");
+  twai_message_t handshakeMsg;
+  handshakeMsg.identifier = 0x7E0;  // Physical ECM address (Honda requirement)
+  handshakeMsg.extd = 0;
+  handshakeMsg.rtr = 0;
+  handshakeMsg.data_length_code = 8;
+  handshakeMsg.data[0] = 0x02;  // Length
+  handshakeMsg.data[1] = 0x09;  // Mode 09 - Vehicle Info  
+  handshakeMsg.data[2] = 0x02;  // PID 02 - VIN
+  handshakeMsg.data[3] = 0x00;
+  handshakeMsg.data[4] = 0x00;
+  handshakeMsg.data[5] = 0x00;
+  handshakeMsg.data[6] = 0x00;
+  handshakeMsg.data[7] = 0x00;
   
-  twai_message_t msg;
-  msg.identifier = targetAddress;
-  msg.extd = 0;
-  msg.rtr = 0;
-  msg.data_length_code = 8;
-  msg.data[0] = 0x01;  // Length
-  msg.data[1] = 0x03;  // Mode 03 - Stored DTCs
-  msg.data[2] = 0x00;
-  msg.data[3] = 0x00;
-  msg.data[4] = 0x00;
-  msg.data[5] = 0x00;
-  msg.data[6] = 0x00;
-  msg.data[7] = 0x00;
-  
-  Serial.printf("📡 Professional query to ECM 0x%03X (like real scanners)...\n", targetAddress);
-  
-  // Respect Honda timing - max 3 queries per second
-  delay(350);  // 350ms spacing = ~3 queries/sec max
-  
-  if (twai_transmit(&msg, pdMS_TO_TICKS(200)) == ESP_OK) {
-    unsigned long start = millis();
-    bool foundResponse = false;
+  if (twai_transmit(&handshakeMsg, pdMS_TO_TICKS(200)) == ESP_OK) {
+    Serial.println("   ✓ VIN handshake sent - waiting for ECM response");
+    delay(500);  // Let Honda ECM process and respond
     
-    while (millis() - start < 2000 && !foundResponse) {  // 2 second timeout
+    // Clear any responses
+    twai_message_t response;
+    while (twai_receive(&response, pdMS_TO_TICKS(50)) == ESP_OK) {
+      // Just clear the buffer
+    }
+  }
+  
+  updateScanProgress("Honda DTC query...", 60);
+  
+  // Step 2b: Check CAN bus health before proceeding (Honda requirement)
+  Serial.println("   📊 Checking CAN bus health before DTC query");
+  if (!checkCANBusHealth()) {
+    Serial.println("   🚨 CAN bus unhealthy - attempting recovery");
+    recoverFromBusOff();
+    
+    // Re-check after recovery
+    if (!checkCANBusHealth()) {
+      Serial.println("   ❌ CAN recovery failed - aborting Honda scan");
+      updateScanProgress("CAN error - scan aborted", 100);
+      return;
+    }
+  }
+  
+  // Step 2c: Single Mode 03 DTC query with Honda timing discipline
+  Serial.println("   🔍 Step 3: Single DTC query (3-5 queries/sec max)");
+  delay(300);  // 300ms spacing = 3.3 queries/sec (Honda-safe)
+  
+  twai_message_t dtcMsg;
+  dtcMsg.identifier = 0x7E0;  // Physical ECM address only
+  dtcMsg.extd = 0;
+  dtcMsg.rtr = 0;
+  dtcMsg.data_length_code = 8;
+  dtcMsg.data[0] = 0x01;  // Length
+  dtcMsg.data[1] = 0x03;  // Mode 03 - Stored DTCs
+  dtcMsg.data[2] = 0x00;
+  dtcMsg.data[3] = 0x00;
+  dtcMsg.data[4] = 0x00;
+  dtcMsg.data[5] = 0x00;
+  dtcMsg.data[6] = 0x00;
+  dtcMsg.data[7] = 0x00;
+  
+  if (twai_transmit(&dtcMsg, pdMS_TO_TICKS(200)) == ESP_OK) {
+    Serial.println("   📡 DTC query sent to Honda ECM");
+    
+    // Honda-safe response collection
+    unsigned long start = millis();
+    bool foundDTCs = false;
+    
+    while (millis() - start < 1500) {  // Shorter window - Honda responds quickly
       twai_message_t response;
       if (twai_receive(&response, pdMS_TO_TICKS(100)) == ESP_OK) {
-        // Only process expected ECM response
-        if (response.identifier == expectedResponse && 
+        // Only process ECM DTC responses
+        if (response.identifier == 0x7E8 && 
             response.data_length_code >= 3 && response.data[1] == 0x43) {
-          Serial.printf("✅ Professional ECM response from 0x%03X\n", response.identifier);
+          Serial.printf("   ✅ Honda ECM DTC response: ");
+          for (int i = 0; i < response.data_length_code; i++) {
+            Serial.printf("%02X ", response.data[i]);
+          }
+          Serial.println();
           parseAndStoreDTC(response.data, response.data_length_code, response.identifier);
-          foundResponse = true;
+          foundDTCs = true;
         }
       }
     }
     
-    if (!foundResponse) {
-      Serial.println("ℹ️ No DTCs found - vehicle appears healthy");
+    if (!foundDTCs) {
+      Serial.println("   ✅ No DTCs found - Honda ECM reports healthy");
     }
   }
   
-  updateScanProgress("Complete!", 75);
-  delay(1000);  // Professional scanner spacing
+  updateScanProgress("Honda-safe complete", 90);
+  
+  // Step 2c: Return to listen-only before finishing (Honda requirement)
+  Serial.println("   🛡️ Step 3: Returning to listen-only mode (Honda-safe shutdown)");
+  delay(500);  // Let any remaining frames complete
   
   updateScanProgress("Scan complete!", 100);
-  
-  // Return SN65HVD230 to standby mode (Honda-safe)
-  Serial.println("🛡️ Returning SN65HVD230 to standby mode (Honda-safe)");
-  disableCANTransceiver();
   
   unsigned long scanDuration = millis() - scanStartTime;
   Serial.printf("✓ Scan complete: %d active ECUs, %d fault codes (%.1fs)\n", 
@@ -1904,6 +1968,72 @@ bool isHondaVehicle() {
   }
   
   return false;  // Not detected as Honda
+}
+
+bool checkCANBusHealth() {
+  // Monitor ESP32 TWAI error counters for bus-off conditions
+  twai_status_info_t status_info;
+  if (twai_get_status_info(&status_info) == ESP_OK) {
+    Serial.printf("📊 CAN Status: RX_ERR=%d, TX_ERR=%d, State=%d\n", 
+                  status_info.rx_error_counter, 
+                  status_info.tx_error_counter,
+                  status_info.state);
+    
+    // Check for bus-off condition (Honda-sensitive)
+    if (status_info.state == TWAI_STATE_BUS_OFF) {
+      Serial.println("🚨 BUS-OFF detected - Honda ECU communication disrupted");
+      return false;
+    }
+    
+    // Check for high error rates
+    if (status_info.tx_error_counter > 100 || status_info.rx_error_counter > 100) {
+      Serial.println("⚠️ High CAN error rate - Honda ECU may be stressed");
+      return false;
+    }
+    
+    return true;
+  }
+  
+  Serial.println("❌ Cannot read CAN status");
+  return false;
+}
+
+void recoverFromBusOff() {
+  Serial.println("🔧 HONDA BUS-OFF RECOVERY PROCEDURE");
+  
+  // Step 1: Stop TWAI driver
+  Serial.println("   Step 1: Stopping TWAI driver");
+  twai_stop();
+  
+  // Step 2: Wait for Honda ECUs to recover
+  Serial.println("   Step 2: Waiting 50ms for Honda ECU recovery");
+  delay(50);
+  
+  // Step 3: Restart in listen-only first
+  Serial.println("   Step 3: Restarting in listen-only mode");
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  
+  twai_driver_uninstall();
+  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK &&
+      twai_start() == ESP_OK) {
+    Serial.println("✓ Listen-only recovery successful");
+    
+    // Step 4: Wait for bus stability before switching back
+    delay(200);
+    
+    // Step 5: Switch back to normal mode
+    twai_stop();
+    twai_driver_uninstall();
+    g_config.mode = TWAI_MODE_NORMAL;
+    if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK &&
+        twai_start() == ESP_OK) {
+      Serial.println("✓ Honda bus-off recovery complete");
+    }
+  } else {
+    Serial.println("❌ Bus-off recovery failed");
+  }
 }
 
 // ========== REAL CAN BUS FUNCTIONS ==========

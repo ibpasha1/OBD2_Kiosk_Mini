@@ -1,0 +1,216 @@
+/*
+ * EXPERIMENTAL DEEP SCAN MODULE
+ * Advanced OBD2 diagnostics for proprietary PIDs and high-end scanner features
+ * 
+ * This module explores:
+ * - Proprietary manufacturer PIDs
+ * - Battery health and SOC for hybrids/EVs
+ * - Oil life monitoring
+ * - Individual sensor testing
+ * - Real-time data streaming
+ * - Raw signal values
+ * - Advanced ECU communication protocols
+ */
+
+#ifndef EXPERIMENTAL_DEEP_SCAN_H
+#define EXPERIMENTAL_DEEP_SCAN_H
+
+// Only include if deep scan is enabled
+#ifdef ENABLE_DEEP_SCAN
+
+#include <Arduino.h>
+#include <driver/twai.h>
+#include <vector>
+
+// ========== ADVANCED PID DEFINITIONS ==========
+
+// Standard Mode 01 PIDs (for reference)
+#define PID_SUPPORTED_01_20     0x00
+#define PID_ENGINE_RPM          0x0C
+#define PID_VEHICLE_SPEED       0x0D
+#define PID_COOLANT_TEMP        0x05
+
+// Advanced Real-time PIDs
+#define PID_FUEL_RAIL_PRESSURE  0x23
+#define PID_O2_SENSOR_1_1       0x24
+#define PID_O2_SENSOR_1_2       0x25
+#define PID_CATALYST_TEMP_B1S1  0x3C
+#define PID_CATALYST_TEMP_B1S2  0x3D
+#define PID_CATALYST_TEMP_B2S1  0x3E
+#define PID_CATALYST_TEMP_B2S2  0x3F
+
+// Mode 09 - Vehicle Information
+#define MODE_09_VIN             0x02
+#define MODE_09_CALIBRATION_ID  0x04
+#define MODE_09_CVN             0x06
+
+// Mode 22 - Enhanced Diagnostic Data (Manufacturer Specific)
+#define MODE_22_ENHANCED        0x22
+
+// ========== MANUFACTURER SPECIFIC PIDS ==========
+
+// Toyota/Lexus Proprietary PIDs
+struct ToyotaPIDs {
+  static const uint16_t BATTERY_SOC = 0x1001;           // Hybrid battery state of charge
+  static const uint16_t BATTERY_TEMP = 0x1002;          // Hybrid battery temperature
+  static const uint16_t BATTERY_VOLTAGE = 0x1003;       // Hybrid battery voltage
+  static const uint16_t BATTERY_CURRENT = 0x1004;       // Hybrid battery current
+  static const uint16_t OIL_LIFE = 0x1010;              // Oil life remaining %
+  static const uint16_t TRANSMISSION_TEMP = 0x1020;     // CVT/transmission temp
+  static const uint16_t EGR_POSITION = 0x1030;          // EGR valve position
+  static const uint16_t TURBO_PRESSURE = 0x1040;        // Turbo boost pressure
+};
+
+// Honda/Acura Proprietary PIDs  
+struct HondaPIDs {
+  static const uint16_t IMA_BATTERY_SOC = 0x2001;       // IMA battery charge
+  static const uint16_t IMA_BATTERY_TEMP = 0x2002;      // IMA battery temperature
+  static const uint16_t OIL_LIFE = 0x2010;              // Oil life monitoring
+  static const uint16_t CVT_TEMP = 0x2020;              // CVT fluid temperature
+  static const uint16_t VTEC_PRESSURE = 0x2030;         // VTEC oil pressure
+};
+
+// Ford Proprietary PIDs
+struct FordPIDs {
+  static const uint16_t BATTERY_SOC = 0x3001;           // Hybrid/EV battery SOC
+  static const uint16_t OIL_LIFE = 0x3010;              // Intelligent oil life
+  static const uint16_t FUEL_LEVEL_RAW = 0x3020;        // Raw fuel level sensor
+  static const uint16_t TIRE_PRESSURE_FL = 0x3030;      // Front left tire pressure
+  static const uint16_t TIRE_PRESSURE_FR = 0x3031;      // Front right tire pressure  
+  static const uint16_t TIRE_PRESSURE_RL = 0x3032;      // Rear left tire pressure
+  static const uint16_t TIRE_PRESSURE_RR = 0x3033;      // Rear right tire pressure
+};
+
+// GM Proprietary PIDs
+struct GMPIDs {
+  static const uint16_t BATTERY_SOC = 0x4001;           // Hybrid battery SOC
+  static const uint16_t OIL_LIFE = 0x4010;              // GM Oil Life System
+  static const uint16_t TRANSMISSION_TEMP = 0x4020;     // Transmission fluid temp
+  static const uint16_t FUEL_TRIM_LONG_B1 = 0x4030;     // Long term fuel trim bank 1
+  static const uint16_t FUEL_TRIM_LONG_B2 = 0x4031;     // Long term fuel trim bank 2
+};
+
+// ========== DEEP SCAN STRUCTURES ==========
+
+struct SensorReading {
+  uint16_t pid;
+  String name;
+  float value;
+  String unit;
+  String status;  // "NORMAL", "HIGH", "LOW", "FAULT"
+  uint32_t timestamp;
+};
+
+struct BatteryHealth {
+  float stateOfCharge;      // Percentage 0-100%
+  float voltage;            // Volts
+  float current;            // Amperes  
+  float temperature;        // Celsius
+  String health;            // "EXCELLENT", "GOOD", "FAIR", "POOR", "CRITICAL"
+  uint16_t cycleCount;      // Battery charge cycles
+};
+
+struct OilLifeData {
+  float remainingPercent;   // Oil life remaining %
+  uint32_t milesSinceChange; // Miles since last change
+  String condition;         // "FRESH", "GOOD", "CHANGE_SOON", "OVERDUE"
+  float viscosity;          // Oil viscosity reading
+  float temperature;        // Oil temperature
+};
+
+struct RealTimeData {
+  std::vector<SensorReading> sensors;
+  uint32_t updateInterval;  // ms between updates
+  bool isStreaming;
+};
+
+// ========== CLASS DEFINITION ==========
+
+class ExperimentalDeepScan {
+private:
+  twai_message_t txMessage;
+  twai_message_t rxMessage;
+  
+  // Manufacturer detection
+  String detectedManufacturer;
+  uint16_t manufacturerCode;
+  
+  // Advanced communication
+  bool initUDSSession(uint16_t ecuId);
+  bool sendMode22Request(uint16_t pid);
+  bool sendManufacturerPID(uint16_t pid);
+  
+  // Data parsing helpers
+  float parseFloat16(uint8_t* data);
+  float parseFloat32(uint8_t* data);
+  uint16_t parseUInt16(uint8_t* data);
+  
+  // Manufacturer-specific parsers
+  BatteryHealth parseToyotaBatteryData(uint8_t* data);
+  BatteryHealth parseHondaBatteryData(uint8_t* data);
+  OilLifeData parseOilLifeData(uint8_t* data, String manufacturer);
+
+public:
+  ExperimentalDeepScan();
+  
+  // Core functions
+  bool initialize();
+  bool detectManufacturer();
+  
+  // Battery diagnostics (Hybrid/EV)
+  BatteryHealth getBatteryHealth();
+  bool testBatteryCells();
+  
+  // Oil life monitoring
+  OilLifeData getOilLife();
+  bool resetOilLife(); // Advanced feature
+  
+  // Individual sensor testing
+  std::vector<SensorReading> testAllSensors();
+  SensorReading testSpecificSensor(uint16_t pid, String name);
+  
+  // Real-time data streaming
+  bool startRealTimeStream(uint32_t intervalMs = 100);
+  void stopRealTimeStream();
+  RealTimeData getRealTimeData();
+  
+  // Advanced diagnostics
+  bool performDeepECUScan();
+  std::vector<String> getAvailablePIDs();
+  bool testECUResponse(uint16_t ecuId);
+  
+  // Raw data access
+  bool sendRawCommand(uint32_t id, uint8_t* data, uint8_t len);
+  std::vector<uint8_t> getRawResponse();
+  
+  // Tire pressure (where supported)
+  std::vector<float> getTirePressures();
+  
+  // Transmission diagnostics
+  SensorReading getTransmissionTemp();
+  float getTransmissionPressure();
+  
+  // Turbo/Supercharger diagnostics
+  float getTurboBoostPressure();
+  float getTurboRPM();
+  
+  // Utility functions
+  String getManufacturerName() { return detectedManufacturer; }
+  void printAdvancedDiagnostics();
+};
+
+// ========== HELPER MACROS ==========
+
+#define DEEP_SCAN_SUCCESS(msg) Serial.println("✅ DEEP SCAN: " + String(msg))
+#define DEEP_SCAN_WARNING(msg) Serial.println("⚠️  DEEP SCAN: " + String(msg))
+#define DEEP_SCAN_ERROR(msg) Serial.println("❌ DEEP SCAN: " + String(msg))
+
+// Timeout constants for advanced operations
+#define UDS_TIMEOUT_MS          5000
+#define MODE22_TIMEOUT_MS       2000  
+#define REALTIME_TIMEOUT_MS     500
+#define MANUFACTURER_DETECT_TIMEOUT_MS 3000  // ✅ REDUCED: 3 seconds instead of 10
+
+#endif // ENABLE_DEEP_SCAN
+
+#endif // EXPERIMENTAL_DEEP_SCAN_H

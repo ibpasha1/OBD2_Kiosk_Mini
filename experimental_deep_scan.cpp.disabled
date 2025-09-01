@@ -1,0 +1,505 @@
+/*
+ * EXPERIMENTAL DEEP SCAN MODULE - IMPLEMENTATION
+ * Advanced OBD2 diagnostics implementation
+ * 
+ * To enable compilation: #define ENABLE_DEEP_SCAN in your main.cpp
+ */
+
+#ifdef ENABLE_DEEP_SCAN
+
+#include "experimental_deep_scan.h"
+
+// ========== CONSTRUCTOR ==========
+
+ExperimentalDeepScan::ExperimentalDeepScan() {
+  detectedManufacturer = "UNKNOWN";
+  manufacturerCode = 0x0000;
+}
+
+// ========== INITIALIZATION ==========
+
+bool ExperimentalDeepScan::initialize() {
+  DEEP_SCAN_SUCCESS("Initializing experimental deep scan module");
+  
+  // TWAI should already be initialized by main code
+  // This just sets up our advanced scanning parameters
+  
+  txMessage.flags = TWAI_MSG_FLAG_NONE;
+  txMessage.identifier = 0x7DF; // Functional addressing
+  txMessage.data_length_code = 8;
+  
+  return true;
+}
+
+// ========== MANUFACTURER DETECTION ==========
+
+bool ExperimentalDeepScan::detectManufacturer() {
+  DEEP_SCAN_SUCCESS("Detecting vehicle manufacturer for proprietary PID access");
+  
+  // Method 1: Read VIN and decode manufacturer
+  txMessage.identifier = 0x7DF;
+  txMessage.data[0] = 0x02;  // Length
+  txMessage.data[1] = 0x09;  // Mode 09 - Vehicle Information
+  txMessage.data[2] = 0x02;  // VIN request
+  txMessage.data[3] = 0x00;
+  txMessage.data[4] = 0x00;
+  txMessage.data[5] = 0x00;
+  txMessage.data[6] = 0x00;
+  txMessage.data[7] = 0x00;
+  txMessage.data_length_code = 8;
+  
+  if (twai_transmit(&txMessage, pdMS_TO_TICKS(1000)) == ESP_OK) {
+    TickType_t startTime = xTaskGetTickCount();
+    
+    while ((xTaskGetTickCount() - startTime) < pdMS_TO_TICKS(MANUFACTURER_DETECT_TIMEOUT_MS)) {
+      if (twai_receive(&rxMessage, pdMS_TO_TICKS(100)) == ESP_OK) {
+        if (rxMessage.data[1] == 0x49 && rxMessage.data[2] == 0x02) {
+          // VIN response received, extract manufacturer code
+          String vinStart = "";
+          for (int i = 3; i < rxMessage.data_length_code && i < 8; i++) {
+            vinStart += char(rxMessage.data[i]);
+          }
+          
+          // Detect manufacturer from VIN prefix
+          if (vinStart.startsWith("JT") || vinStart.startsWith("1T") || vinStart.startsWith("5T")) {
+            detectedManufacturer = "TOYOTA";
+            manufacturerCode = 0x1000;
+            DEEP_SCAN_SUCCESS("Detected Toyota/Lexus - Enabling Toyota proprietary PIDs");
+            return true;
+          }
+          else if (vinStart.startsWith("1H") || vinStart.startsWith("JH") || vinStart.startsWith("19")) {
+            detectedManufacturer = "HONDA";
+            manufacturerCode = 0x2000;
+            DEEP_SCAN_SUCCESS("Detected Honda/Acura - Enabling Honda proprietary PIDs");
+            return true;
+          }
+          else if (vinStart.startsWith("1F") || vinStart.startsWith("3F")) {
+            detectedManufacturer = "FORD";
+            manufacturerCode = 0x3000;
+            DEEP_SCAN_SUCCESS("Detected Ford - Enabling Ford proprietary PIDs");
+            return true;
+          }
+          else if (vinStart.startsWith("1G") || vinStart.startsWith("KL")) {
+            detectedManufacturer = "GM";
+            manufacturerCode = 0x4000;
+            DEEP_SCAN_SUCCESS("Detected GM - Enabling GM proprietary PIDs");
+            return true;
+          }
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+  
+  DEEP_SCAN_WARNING("Could not detect manufacturer - using generic PIDs only");
+  return false;
+}
+
+// ========== UDS SESSION MANAGEMENT ==========
+
+bool ExperimentalDeepScan::initUDSSession(uint16_t ecuId) {
+  DEEP_SCAN_SUCCESS("Initializing UDS diagnostic session for ECU: 0x" + String(ecuId, HEX));
+  
+  // UDS Diagnostic Session Control - Extended Session
+  txMessage.identifier = 0x700 + ecuId; // Direct ECU addressing
+  txMessage.data[0] = 0x02;  // Length
+  txMessage.data[1] = 0x10;  // Diagnostic Session Control
+  txMessage.data[2] = 0x03;  // Extended Diagnostic Session
+  txMessage.data[3] = 0x00;
+  txMessage.data[4] = 0x00;
+  txMessage.data[5] = 0x00;
+  txMessage.data[6] = 0x00;
+  txMessage.data[7] = 0x00;
+  txMessage.data_length_code = 8;
+  
+  if (twai_transmit(&txMessage, pdMS_TO_TICKS(1000)) == ESP_OK) {
+    TickType_t startTime = xTaskGetTickCount();
+    
+    while ((xTaskGetTickCount() - startTime) < pdMS_TO_TICKS(UDS_TIMEOUT_MS)) {
+      if (twai_receive(&rxMessage, pdMS_TO_TICKS(100)) == ESP_OK) {
+        if (rxMessage.data[1] == 0x50) { // Positive response
+          DEEP_SCAN_SUCCESS("UDS Extended Session established");
+          return true;
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+  
+  DEEP_SCAN_WARNING("Could not establish UDS session for ECU: 0x" + String(ecuId, HEX));
+  return false;
+}
+
+// ========== MODE 22 ENHANCED DATA ==========
+
+bool ExperimentalDeepScan::sendMode22Request(uint16_t pid) {
+  // Mode 22 - Read Data By Identifier (Enhanced diagnostic data)
+  txMessage.identifier = 0x7DF;
+  txMessage.data[0] = 0x03;  // Length
+  txMessage.data[1] = 0x22;  // Mode 22
+  txMessage.data[2] = (pid >> 8) & 0xFF;   // PID high byte
+  txMessage.data[3] = pid & 0xFF;          // PID low byte
+  txMessage.data[4] = 0x00;
+  txMessage.data[5] = 0x00;
+  txMessage.data[6] = 0x00;
+  txMessage.data[7] = 0x00;
+  txMessage.data_length_code = 8;
+  
+  return twai_transmit(&txMessage, pdMS_TO_TICKS(1000)) == ESP_OK;
+}
+
+// ========== BATTERY HEALTH DIAGNOSTICS ==========
+
+BatteryHealth ExperimentalDeepScan::getBatteryHealth() {
+  BatteryHealth battery = {0};
+  battery.health = "UNKNOWN";
+  
+  DEEP_SCAN_SUCCESS("Reading hybrid/EV battery health data");
+  
+  if (detectedManufacturer == "TOYOTA") {
+    // Toyota Hybrid Battery Diagnostics
+    if (sendMode22Request(ToyotaPIDs::BATTERY_SOC)) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      if (twai_receive(&rxMessage, pdMS_TO_TICKS(MODE22_TIMEOUT_MS)) == ESP_OK) {
+        battery = parseToyotaBatteryData(rxMessage.data);
+      }
+    }
+  }
+  else if (detectedManufacturer == "HONDA") {
+    // ✅ CONSERVATIVE: Skip Honda IMA battery requests for non-hybrid Hondas
+    // Honda IMA is only available on Accord Hybrid, Insight, CR-Z - NOT regular Civics
+    DEEP_SCAN_WARNING("Honda detected but skipping IMA battery (likely non-hybrid)");
+    // Use generic battery voltage instead
+    battery.health = "NON_HYBRID";
+  }
+  else {
+    // Generic battery voltage from standard PIDs
+    txMessage.identifier = 0x7DF;
+    txMessage.data[0] = 0x02;
+    txMessage.data[1] = 0x01;  // Mode 01
+    txMessage.data[2] = 0x42;  // Control module voltage
+    txMessage.data[3] = 0x00;
+    txMessage.data_length_code = 8;
+    
+    if (twai_transmit(&txMessage, pdMS_TO_TICKS(1000)) == ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      if (twai_receive(&rxMessage, pdMS_TO_TICKS(1000)) == ESP_OK) {
+        if (rxMessage.data[0] > 2) {
+          uint16_t voltage_raw = (rxMessage.data[3] << 8) + rxMessage.data[4];
+          battery.voltage = voltage_raw / 1000.0;
+          
+          if (battery.voltage > 13.5) battery.health = "EXCELLENT";
+          else if (battery.voltage > 12.6) battery.health = "GOOD";
+          else if (battery.voltage > 12.0) battery.health = "FAIR";
+          else battery.health = "POOR";
+        }
+      }
+    }
+  }
+  
+  return battery;
+}
+
+// ========== OIL LIFE MONITORING ==========
+
+OilLifeData ExperimentalDeepScan::getOilLife() {
+  OilLifeData oil = {0};
+  oil.condition = "UNKNOWN";
+  
+  DEEP_SCAN_SUCCESS("Reading oil life monitoring data");
+  
+  uint16_t oilPID = 0x0000;
+  
+  if (detectedManufacturer == "TOYOTA") {
+    oilPID = ToyotaPIDs::OIL_LIFE;
+  }
+  else if (detectedManufacturer == "HONDA") {
+    oilPID = HondaPIDs::OIL_LIFE;
+  }
+  else if (detectedManufacturer == "FORD") {
+    oilPID = FordPIDs::OIL_LIFE;
+  }
+  else if (detectedManufacturer == "GM") {
+    oilPID = GMPIDs::OIL_LIFE;
+  }
+  
+  if (oilPID != 0x0000) {
+    if (sendMode22Request(oilPID)) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      if (twai_receive(&rxMessage, pdMS_TO_TICKS(MODE22_TIMEOUT_MS)) == ESP_OK) {
+        oil = parseOilLifeData(rxMessage.data, detectedManufacturer);
+      }
+    }
+  } else {
+    DEEP_SCAN_WARNING("Oil life monitoring not supported for this manufacturer");
+  }
+  
+  return oil;
+}
+
+// ========== INDIVIDUAL SENSOR TESTING ==========
+
+std::vector<SensorReading> ExperimentalDeepScan::testAllSensors() {
+  std::vector<SensorReading> sensors;
+  
+  DEEP_SCAN_SUCCESS("Testing all available sensors");
+  
+  // ✅ CONSERVATIVE: Standard sensors with delays to prevent CAN bus flooding
+  sensors.push_back(testSpecificSensor(0x05, "Coolant Temperature"));
+  vTaskDelay(pdMS_TO_TICKS(300)); // Delay between requests
+  sensors.push_back(testSpecificSensor(0x0C, "Engine RPM")); 
+  vTaskDelay(pdMS_TO_TICKS(300));
+  sensors.push_back(testSpecificSensor(0x0D, "Vehicle Speed"));
+  vTaskDelay(pdMS_TO_TICKS(300)); 
+  sensors.push_back(testSpecificSensor(0x11, "Throttle Position"));
+  vTaskDelay(pdMS_TO_TICKS(300));
+  
+  // ✅ REDUCED: Only test 4 core sensors instead of 12+ to minimize CAN traffic
+  
+  // ✅ CONSERVATIVE: Skip manufacturer-specific sensors to prevent ECU confusion
+  // Toyota/Honda proprietary PIDs can cause communication errors on wrong vehicles
+  if (detectedManufacturer == "TOYOTA") {
+    DEEP_SCAN_WARNING("Toyota detected - skipping proprietary PIDs for safety");
+  }
+  else if (detectedManufacturer == "HONDA") {
+    DEEP_SCAN_WARNING("Honda detected - skipping proprietary PIDs for safety"); 
+  }
+  
+  return sensors;
+}
+
+SensorReading ExperimentalDeepScan::testSpecificSensor(uint16_t pid, String name) {
+  SensorReading sensor = {0};
+  sensor.pid = pid;
+  sensor.name = name;
+  sensor.status = "NO_DATA";
+  sensor.timestamp = millis();
+  
+  // Standard Mode 01 PID
+  if (pid <= 0xFF) {
+    txMessage.identifier = 0x7DF;
+    txMessage.data[0] = 0x02;
+    txMessage.data[1] = 0x01;  // Mode 01
+    txMessage.data[2] = pid & 0xFF;
+    txMessage.data[3] = 0x00;
+    txMessage.data_length_code = 8;
+  } else {
+    // Mode 22 for proprietary PIDs
+    if (!sendMode22Request(pid)) {
+      sensor.status = "COMM_ERROR";
+      return sensor;
+    }
+  }
+  
+  if (twai_transmit(&txMessage, pdMS_TO_TICKS(500)) == ESP_OK) {
+    vTaskDelay(pdMS_TO_TICKS(200)); // ✅ INCREASED: 200ms delay to prevent CAN bus flooding
+    if (twai_receive(&rxMessage, pdMS_TO_TICKS(1000)) == ESP_OK) {
+      // Parse based on PID type
+      switch (pid) {
+        case 0x05: // Coolant temp
+          sensor.value = rxMessage.data[3] - 40;
+          sensor.unit = "°C";
+          sensor.status = (sensor.value > 100) ? "HIGH" : (sensor.value < 80) ? "LOW" : "NORMAL";
+          break;
+          
+        case 0x0C: // RPM
+          sensor.value = ((rxMessage.data[3] << 8) + rxMessage.data[4]) / 4.0;
+          sensor.unit = "RPM";
+          sensor.status = (sensor.value > 6000) ? "HIGH" : (sensor.value < 500) ? "LOW" : "NORMAL";
+          break;
+          
+        case 0x0D: // Speed
+          sensor.value = rxMessage.data[3];
+          sensor.unit = "km/h";
+          sensor.status = "NORMAL";
+          break;
+          
+        case 0x11: // Throttle position
+          sensor.value = (rxMessage.data[3] * 100.0) / 255.0;
+          sensor.unit = "%";
+          sensor.status = "NORMAL";
+          break;
+          
+        default:
+          // Generic parsing
+          sensor.value = parseFloat16(&rxMessage.data[3]);
+          sensor.unit = "raw";
+          sensor.status = "NORMAL";
+          break;
+      }
+    } else {
+      sensor.status = "NO_RESPONSE";
+    }
+  } else {
+    sensor.status = "SEND_FAILED";
+  }
+  
+  return sensor;
+}
+
+// ========== REAL-TIME DATA STREAMING ==========
+
+bool ExperimentalDeepScan::startRealTimeStream(uint32_t intervalMs) {
+  DEEP_SCAN_SUCCESS("Starting real-time data streaming at " + String(intervalMs) + "ms intervals");
+  // Implementation would use FreeRTOS task for continuous streaming
+  return true;
+}
+
+// ========== TIRE PRESSURE MONITORING ==========
+
+std::vector<float> ExperimentalDeepScan::getTirePressures() {
+  std::vector<float> pressures;
+  
+  if (detectedManufacturer == "FORD") {
+    // Ford TPMS PIDs
+    uint16_t tpmsPIDs[] = {
+      FordPIDs::TIRE_PRESSURE_FL,
+      FordPIDs::TIRE_PRESSURE_FR, 
+      FordPIDs::TIRE_PRESSURE_RL,
+      FordPIDs::TIRE_PRESSURE_RR
+    };
+    
+    for (int i = 0; i < 4; i++) {
+      if (sendMode22Request(tpmsPIDs[i])) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (twai_receive(&rxMessage, pdMS_TO_TICKS(1000)) == ESP_OK) {
+          float pressure = parseFloat16(&rxMessage.data[3]) / 6.895; // Convert kPa to PSI
+          pressures.push_back(pressure);
+        } else {
+          pressures.push_back(0.0); // No data
+        }
+      }
+    }
+  } else {
+    DEEP_SCAN_WARNING("TPMS data not available for this manufacturer");
+  }
+  
+  return pressures;
+}
+
+// ========== DATA PARSING HELPERS ==========
+
+float ExperimentalDeepScan::parseFloat16(uint8_t* data) {
+  return ((data[0] << 8) + data[1]) / 100.0;
+}
+
+float ExperimentalDeepScan::parseFloat32(uint8_t* data) {
+  uint32_t raw = (data[0] << 24) + (data[1] << 16) + (data[2] << 8) + data[3];
+  return *((float*)&raw);
+}
+
+BatteryHealth ExperimentalDeepScan::parseToyotaBatteryData(uint8_t* data) {
+  BatteryHealth battery = {0};
+  
+  if (data[1] == 0x62) { // Positive response to Mode 22
+    battery.stateOfCharge = data[4]; // Percentage
+    battery.voltage = parseFloat16(&data[5]);
+    battery.temperature = data[7] - 40; // Offset
+    
+    if (battery.stateOfCharge > 80) battery.health = "EXCELLENT";
+    else if (battery.stateOfCharge > 60) battery.health = "GOOD";
+    else if (battery.stateOfCharge > 40) battery.health = "FAIR";
+    else battery.health = "POOR";
+  }
+  
+  return battery;
+}
+
+BatteryHealth ExperimentalDeepScan::parseHondaBatteryData(uint8_t* data) {
+  BatteryHealth battery = {0};
+  
+  if (data[1] == 0x62) { // Positive response to Mode 22
+    // Honda IMA battery format
+    battery.stateOfCharge = data[4]; // Percentage
+    battery.voltage = parseFloat16(&data[5]);
+    battery.temperature = data[7] - 40; // Offset for temperature
+    
+    // Honda-specific health assessment
+    if (battery.stateOfCharge > 75) battery.health = "EXCELLENT";
+    else if (battery.stateOfCharge > 50) battery.health = "GOOD";
+    else if (battery.stateOfCharge > 25) battery.health = "FAIR";
+    else battery.health = "POOR";
+  }
+  
+  return battery;
+}
+
+OilLifeData ExperimentalDeepScan::parseOilLifeData(uint8_t* data, String manufacturer) {
+  OilLifeData oil = {0};
+  
+  if (data[1] == 0x62) { // Positive response
+    oil.remainingPercent = data[4]; // Percentage remaining
+    
+    if (oil.remainingPercent > 50) oil.condition = "GOOD";
+    else if (oil.remainingPercent > 15) oil.condition = "CHANGE_SOON";
+    else oil.condition = "OVERDUE";
+  }
+  
+  return oil;
+}
+
+// ========== ADVANCED ECU TESTING ==========
+
+bool ExperimentalDeepScan::performDeepECUScan() {
+  DEEP_SCAN_SUCCESS("Performing deep ECU communication scan");
+  
+  // Test all common ECU addresses
+  uint16_t ecuAddresses[] = {
+    0x10, 0x11, 0x18, 0x28, 0x29, 0x2A, 0x2B, 0x2C,
+    0x30, 0x38, 0x39, 0x3A, 0x50, 0x58, 0x60, 0x61
+  };
+  
+  int respondingECUs = 0;
+  
+  for (int i = 0; i < 16; i++) {
+    if (testECUResponse(ecuAddresses[i])) {
+      respondingECUs++;
+      DEEP_SCAN_SUCCESS("ECU 0x" + String(ecuAddresses[i], HEX) + " responding");
+    }
+    vTaskDelay(pdMS_TO_TICKS(100)); // Don't flood the bus
+  }
+  
+  DEEP_SCAN_SUCCESS("Deep scan complete: " + String(respondingECUs) + " ECUs responding");
+  return respondingECUs > 0;
+}
+
+bool ExperimentalDeepScan::testECUResponse(uint16_t ecuId) {
+  // Send tester present to specific ECU
+  txMessage.identifier = 0x700 + ecuId;
+  txMessage.data[0] = 0x01;  // Length
+  txMessage.data[1] = 0x3E;  // Tester Present
+  txMessage.data[2] = 0x00;
+  txMessage.data_length_code = 8;
+  
+  if (twai_transmit(&txMessage, pdMS_TO_TICKS(500)) == ESP_OK) {
+    TickType_t startTime = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - startTime) < pdMS_TO_TICKS(1000)) {
+      if (twai_receive(&rxMessage, pdMS_TO_TICKS(50)) == ESP_OK) {
+        if (rxMessage.identifier == (0x700 + ecuId + 0x08) && rxMessage.data[1] == 0x7E) {
+          return true; // Positive response
+        }
+      }
+    }
+  }
+  
+  return false;
+}
+
+// ========== DEBUG OUTPUT ==========
+
+void ExperimentalDeepScan::printAdvancedDiagnostics() {
+  Serial.println("=== EXPERIMENTAL DEEP SCAN RESULTS ===");
+  Serial.println("Manufacturer: " + detectedManufacturer);
+  Serial.println("Manufacturer Code: 0x" + String(manufacturerCode, HEX));
+  
+  BatteryHealth battery = getBatteryHealth();
+  Serial.println("Battery Health: " + battery.health);
+  Serial.println("Battery SOC: " + String(battery.stateOfCharge) + "%");
+  
+  OilLifeData oil = getOilLife();
+  Serial.println("Oil Life: " + String(oil.remainingPercent) + "% (" + oil.condition + ")");
+  
+  Serial.println("=====================================");
+}
+
+#endif // ENABLE_DEEP_SCAN
